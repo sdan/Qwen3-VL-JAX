@@ -3,7 +3,7 @@
 
 A minimal, readable implementation of Qwen3‑VL inference in JAX/Flax(no PyTorch or HuggingFace(except tokenizers)!)
 
-- `model.py` — Text decoder, vision encoder, mRoPE, GQA, loaders
+- `model.py` — Text decoder, vision encoder, mRoPE, GQA, loaders - all in 718 loc
 - `sample.py` — Image preprocessing, prompting helpers, top‑k/top‑p sampling
 - `utils.py` — Config (chz), logging, checkpoints, HF→JAX conversion
 - `run.py` — Minimal CLI example
