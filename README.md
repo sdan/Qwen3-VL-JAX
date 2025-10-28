@@ -1,4 +1,4 @@
-# Qwen3‑VL written in JAX
+# Qwen3‑VL written in JAX 🏄
 <img width="1045" height="361" alt="Screenshot 2025-10-28 at 1 57 42 AM" src="https://github.com/user-attachments/assets/35734b42-6347-4bf1-b090-817ad5781244" />
 
 A minimal, readable implementation of Qwen3‑VL inference in JAX/Flax(no PyTorch or HuggingFace(except tokenizers)!)
@@ -8,8 +8,7 @@ A minimal, readable implementation of Qwen3‑VL inference in JAX/Flax(no PyTorc
 - `utils.py` — Config (chz), logging, checkpoints, HF→JAX conversion
 - `run.py` — Minimal CLI example
 
-
-Model implementation:
+Qwen3-VL-2B TLDR:
 
 - Decoder: 28 layers, 2048 hidden, GQA (16 Q heads, 8 KV heads)
 - Vision: ViT with window attention and 2×2 spatial merge
@@ -63,17 +62,15 @@ print(result.texts[0])
 ```
 
 
-## Config
-I saw ThinkingMachines use chz so I decided to make it first-class:
-- Type‑checked configs with OpenAI's [chz](https://github.com/openai/chz)
-- Override any field from the CLI, e.g.
-  - `uv run python run.py --image img.jpg sampling.temperature=0.95 sampling.max_new_tokens=512 model.dtype=float32`
+I saw ThinkingMachines use chz so I decided to make it first-class. This also allows you to easily swap config right in the CLI as such:
+`uv run python run.py --image img.jpg sampling.temperature=0.95 sampling.max_new_tokens=512 model.dtype=float32`
 
-## Performance (2B, bf16, Apple M1 Max)
-
+Some performance stats on my M1 Max Macbook:
 - Prefill ~150 ms (512 text + 1k vision)
 - Decode ~30 ms/token (~33 tok/s)
 - ~6 GB total memory (weights+cache+acts)
+
+Most of this code was taken from (sdan/vlm-gym)[https://github.com/sdan/vlm-gym] as an attempt to cleanly abstract it out to sample from the policy optimization loop. As mentioned previously the impetus was mainly I couldnt find a KV Cache impl of the Qwen vision models so I wrote this, your main contribution would ideally be on speed-up optimizations; thanks!
 
 
 
