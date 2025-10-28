@@ -1,0 +1,52 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+
+# JAX/Flax
+*.pkl
+*.msgpack
+
+# Checkpoints and model files
+checkpoints/
+*.safetensors
+params.pkl
+
+# Logs
+*.log
+logs/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Cache
+.uv_cache/
+.cache/
+__pypackages__/
+
+# Environment
+.env
+.venv/
+env/
+venv/
+
+# Claude Code
+.claude/
+
+# Test outputs
+test_outputs/
+outputs/
