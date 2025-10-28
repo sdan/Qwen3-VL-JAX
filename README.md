@@ -1,9 +1,22 @@
-# Qwen3‑VL (JAX)
+# Qwen3‑VL written in JAX
+<img width="1045" height="361" alt="Screenshot 2025-10-28 at 1 57 42 AM" src="https://github.com/user-attachments/assets/35734b42-6347-4bf1-b090-817ad5781244" />
 
-A minimal, readable implementation of Qwen3‑VL inference in JAX/Flax.
+A minimal, readable implementation of Qwen3‑VL inference in JAX/Flax(no PyTorch or HuggingFace(except tokenizers)!)
 
-The code is compact and focused on clarity. No PyTorch dependency.
+- `model.py` — Text decoder, vision encoder, mRoPE, GQA, loaders
+- `sample.py` — Image preprocessing, prompting helpers, top‑k/top‑p sampling
+- `utils.py` — Config (chz), logging, checkpoints, HF→JAX conversion
+- `run.py` — Minimal CLI example
 
+
+Model implementation:
+
+- Decoder: 28 layers, 2048 hidden, GQA (16 Q heads, 8 KV heads)
+- Vision: ViT with window attention and 2×2 spatial merge
+- Positional encoding: 1D RoPE for text, 3D mRoPE for vision (t/h/w)
+- Additional: QK‑norm, grouped‑query attention (2× smaller KV cache)
+- Comes with KV Cache on inference(could not find this in the official/hf implementation, the impetus for this one)
+  
 ## Quickstart
 
 - Clone and convert HuggingFace weights to JAX
@@ -16,7 +29,7 @@ The code is compact and focused on clarity. No PyTorch dependency.
   - `uv run python run.py --image examples/imgs/demo.jpg --prompt "What is in this image?"`
   - With overrides: `uv run python run.py --image examples/imgs/demo.jpg --prompt "Describe this" model.model_dir=./checkpoints/qwen3vl_2b sampling.temperature=0.8 sampling.max_new_tokens=256`
 
-## Minimal Python Example
+## Minimal Example
 
 ```python
 import jax
@@ -49,23 +62,10 @@ result = sample(model, params, inputs, cfg, jax.random.PRNGKey(42), tokenizer=to
 print(result.texts[0])
 ```
 
-## Files
 
-- `model.py` — Text decoder, vision encoder, mRoPE, GQA, loaders
-- `sample.py` — Image preprocessing, prompting helpers, top‑k/top‑p sampling
-- `utils.py` — Config (chz), logging, checkpoints, HF→JAX conversion
-- `run.py` — Minimal CLI example
-
-## Model At A Glance
-
-- Decoder: 28 layers, 2048 hidden, GQA (16 Q heads, 8 KV heads)
-- Vision: ViT with window attention and 2×2 spatial merge
-- Positional encoding: 1D RoPE for text, 3D mRoPE for vision (t/h/w)
-- Tricks: QK‑norm, grouped‑query attention (2× smaller KV cache)
-
-## Config & Overrides
-
-- Type‑checked configs with [chz](https://github.com/openai/chz)
+## Config
+I saw ThinkingMachines use chz so I decided to make it first-class:
+- Type‑checked configs with OpenAI's [chz](https://github.com/openai/chz)
 - Override any field from the CLI, e.g.
   - `uv run python run.py --image img.jpg sampling.temperature=0.95 sampling.max_new_tokens=512 model.dtype=float32`
 
@@ -75,27 +75,10 @@ print(result.texts[0])
 - Decode ~30 ms/token (~33 tok/s)
 - ~6 GB total memory (weights+cache+acts)
 
-## Philosophy
 
-- Minimal, flat, readable; delete before adding
-- JAX‑first: jit, scan, PyTrees; no hidden state
-- One place per idea; no deep indirection
 
-## Why uv
-
-- Fast, deterministic, and built‑in virtualenvs
-- `uv sync` to install, `uv run python run.py` to execute
-
-## Testing
-
-- Imports: `uv run python -c "import model, sample, utils"`
-- Demo: `uv run python run.py --image examples/imgs/demo.jpg --prompt "Describe this image"`
 
 ## Credits
 
 - Qwen team (model)
 - Checkpoint helpers adapted from community projects listed in code
-
-## License
-
-Apache‑2.0
