@@ -298,7 +298,7 @@ def _prefill_text(model, params, tokens: jnp.ndarray, pad_id: int, spec: _RopeSp
                                rope_scaling_factor=spec.rope_scaling_factor)
     cache = _init_cache(spec, tokens.shape[0], int(max_cache_len or tokens.shape[1]))
 
-    @jax.jit(donate_argnums=(5,))
+    @jax.jit(donate_argnames=['cache'])
     def _prefill(params, tokens, cos, sin, mask, cache):
         _, cache_out = model.apply({"params": params}, tokens, cos, sin, mask=mask, cache=cache,
                                   method=model.forward_text)
@@ -348,7 +348,7 @@ def _prefill_vlm(model, params, tokens: jnp.ndarray, vision: Union[VisionEmbeddi
         vision_arr = jnp.asarray(vision, dtype=spec.dtype)
         vision_pack = VisionEmbeddings(tokens=vision_arr, deepstack=())
 
-    @jax.jit(donate_argnums=(7,))
+    @jax.jit(donate_argnames=['cache'])
     def _prefill(params, tokens, vision_pack, image_pad_id, cos, sin, mask, cache):
         logits, cache_out = model.apply({"params": params}, tokens, vision_pack, image_pad_id,
                                         cos, sin, mask=mask, cache=cache, method=model.forward_vlm)
@@ -375,7 +375,7 @@ def _decode_loop(model, params, cache: KVCache, first_token: jnp.ndarray, steps:
     use_top_k = int(top_k) if top_k is not None else 0
     topp_val = float(top_p) if (top_p and 0.0 < float(top_p) < 1.0) else None
 
-    @jax.jit(donate_argnums=(2,))
+    @jax.jit(donate_argnames=['cache_init'])
     def _scan_decode(params, offsets, cache_init, first_tok, rng_init):
         def _one_step(params, offsets, carry, _):
             cache_state, current_tok, rng_state, stopped = carry
@@ -504,7 +504,7 @@ def sample_streaming(model, params, inputs: Union[VLMInputs, jnp.ndarray, np.nda
                          else jnp.zeros((1, 1), dtype=jnp.int32))
 
     # JIT-compile single decode step for performance
-    @jax.jit(donate_argnums=(2,))
+    @jax.jit(donate_argnames=['cache_state'])
     def _single_step(params, token, cache_state, offsets, rng_key):
         step_mask = jnp.ones((1, 1), dtype=jnp.int32)
         logits, cache_new = model.apply({"params": params}, token, cache_state,
