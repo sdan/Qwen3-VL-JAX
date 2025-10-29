@@ -115,8 +115,18 @@ def main(cfg: Config) -> None:
     t1 = time.perf_counter()
 
     # Extract and display
-    response_text = result.texts[0] if result.texts else ""
-    assistant_response = extract_assistant(response_text)
+    # Decode using full prompt + generated tokens so extract_assistant can find markers.
+    try:
+        new_ids = result.tokens[0].tolist()
+        full_ids = prompt_tokens + new_ids
+        full_text = tokenizer.decode(full_ids, skip_special_tokens=False, clean_up_tokenization_spaces=False)
+    except Exception:
+        full_text = result.texts[0] if result.texts else ""
+
+    assistant_response = extract_assistant(full_text)
+    if not assistant_response:
+        # Fallback: show decoded new tokens only (without special tokens)
+        assistant_response = (result.texts[0] if result.texts else "").strip()
 
     print("\n" + "=" * 60)
     print("RESPONSE:")

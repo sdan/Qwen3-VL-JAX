@@ -13,27 +13,27 @@ A minimal, readable implementation of Qwen3‑VL inference in JAX/Flax(no PyTorc
 - Decode ~30 ms/token (~33 tok/s)
 - ~6 GB total memory (weights+cache+acts)
 
-## Qwen3-VL-2B Card:
+## Qwen3-VL-4B Card (default):
 
-- Decoder: 28 layers, 2048 hidden, GQA (16 Q heads, 8 KV heads)
+- Decoder: Transformer with GQA; depth/width taken from HF config
 - Vision: ViT with window attention and 2×2 spatial merge
 - Positional encoding: 1D RoPE for text, 3D mRoPE for vision (t/h/w)
-- Additional: QK‑norm, grouped‑query attention (2× smaller KV cache)
-- Comes with KV Cache on inference(could not find this in the official/hf implementation, the impetus for this one)
+- Additional: QK‑norm, grouped‑query attention (smaller KV cache)
+- Includes KV cache for fast autoregressive decoding
   
 ## Quickstart
 
 - Clone and convert HuggingFace weights to JAX
   - `git clone https://github.com/sdan/Qwen3-VL-JAX.git && cd Qwen3-VL-JAX`
-  - `huggingface-cli download Qwen/Qwen3-VL-2B-Instruct --local-dir checkpoints/qwen3vl_2b`
+  - `huggingface-cli download Qwen/Qwen3-VL-4B-Instruct --local-dir checkpoints/qwen3vl_4b`
   - `uv sync` (CPU/default)
   - For CUDA 12 GPU support: `uv sync --extra cuda12`
-  - `uv run python -c "from utils import convert_hf_to_jax; convert_hf_to_jax('qwen3vl','./checkpoints/qwen3vl_2b')"`
+  - `uv run python -c "from utils import convert_hf_to_jax; convert_hf_to_jax('qwen3vl','./checkpoints/qwen3vl_4b')"`
 
 - Run inference (CLI)
   - `uv run python run.py inference.image=examples/imgs/panda_climbing.png`
   - With custom prompt: `uv run python run.py inference.image=examples/imgs/panda_climbing.png inference.prompt="What is in this image?"`
-  - With overrides: `uv run python run.py inference.image=examples/imgs/panda_climbing.png inference.prompt="Describe this" model.model_dir=./checkpoints/qwen3vl_2b sampling.temperature=0.8 sampling.max_new_tokens=256`
+  - With overrides: `uv run python run.py inference.image=examples/imgs/panda_climbing.png inference.prompt="Describe this" model.model_dir=./checkpoints/qwen3vl_4b sampling.temperature=0.8 sampling.max_new_tokens=256`
   - CUDA (opinionated): `JAX_PLATFORMS=gpu,cpu uv run python run.py inference.image=examples/imgs/panda_climbing.png inference.device=cuda sampling.max_new_tokens=256`
     - Prints tokens/sec; keeps params, prefill, and decode on GPU.
 
@@ -45,8 +45,8 @@ from model import create_model_from_ckpt
 from sample import sample, SamplingConfig, VLMInputs, preprocess_image, chat_prompt_with_image
 from transformers import AutoTokenizer
 
-model, params = create_model_from_ckpt("./checkpoints/qwen3vl_2b")
-tokenizer = AutoTokenizer.from_pretrained("./checkpoints/qwen3vl_2b", trust_remote_code=True)
+model, params = create_model_from_ckpt("./checkpoints/qwen3vl_4b")
+tokenizer = AutoTokenizer.from_pretrained("./checkpoints/qwen3vl_4b", trust_remote_code=True)
 
 pixel_values, grid_thw = preprocess_image("image.jpg",
     patch_size=model.spec.vision.patch_size,

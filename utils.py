@@ -179,7 +179,7 @@ class Checkpoint:
 @chz.chz
 class ModelConfig:
     """Model loading configuration"""
-    model_dir: str = "checkpoints/qwen3vl_2b"
+    model_dir: str = "checkpoints/qwen3vl_4b"
     """Path to checkpoint directory"""
     dtype: str = "bfloat16"
     """Model dtype: bfloat16, float32, or float16"""
@@ -318,7 +318,7 @@ def convert_hf_to_jax(model_type: str, model_dir: str, hf_dir: Optional[str] = N
     if hf_repo is None:
         hf_repo = {
             "qwen25vl": "Qwen/Qwen2.5-VL-7B-Instruct",
-            "qwen3vl": "Qwen/Qwen3-VL-2B-Instruct",
+            "qwen3vl": "Qwen/Qwen3-VL-4B-Instruct",
         }[model_type]
 
     ckpt_dir = _ensure_trailing_slash(os.path.expanduser(model_dir))
