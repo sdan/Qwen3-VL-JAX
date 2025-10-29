@@ -298,11 +298,11 @@ def _prefill_text(model, params, tokens: jnp.ndarray, pad_id: int, spec: _RopeSp
                                rope_scaling_factor=spec.rope_scaling_factor)
     cache = _init_cache(spec, tokens.shape[0], int(max_cache_len or tokens.shape[1]))
 
-    @jax.jit(donate_argnames=['cache'])
     def _prefill(params, tokens, cos, sin, mask, cache):
         _, cache_out = model.apply({"params": params}, tokens, cos, sin, mask=mask, cache=cache,
                                   method=model.forward_text)
         return cache_out
+    _prefill = jax.jit(_prefill, donate_argnames=['cache'])
 
     cache_out = _prefill(params, tokens, cos, sin, mask, cache)
     rope_deltas = jnp.zeros((tokens.shape[0], 1), dtype=jnp.int32)
@@ -348,11 +348,11 @@ def _prefill_vlm(model, params, tokens: jnp.ndarray, vision: Union[VisionEmbeddi
         vision_arr = jnp.asarray(vision, dtype=spec.dtype)
         vision_pack = VisionEmbeddings(tokens=vision_arr, deepstack=())
 
-    @jax.jit(donate_argnames=['cache'])
     def _prefill(params, tokens, vision_pack, image_pad_id, cos, sin, mask, cache):
         logits, cache_out = model.apply({"params": params}, tokens, vision_pack, image_pad_id,
                                         cos, sin, mask=mask, cache=cache, method=model.forward_vlm)
         return logits, cache_out
+    _prefill = jax.jit(_prefill, donate_argnames=['cache'])
 
     logits, cache = _prefill(params, tokens, vision_pack, image_pad_id, cos, sin, mask, cache)
     return logits, cache, deltas.astype(jnp.int32)
@@ -375,7 +375,6 @@ def _decode_loop(model, params, cache: KVCache, first_token: jnp.ndarray, steps:
     use_top_k = int(top_k) if top_k is not None else 0
     topp_val = float(top_p) if (top_p and 0.0 < float(top_p) < 1.0) else None
 
-    @jax.jit(donate_argnames=['cache_init'])
     def _scan_decode(params, offsets, cache_init, first_tok, rng_init):
         def _one_step(params, offsets, carry, _):
             cache_state, current_tok, rng_state, stopped = carry
@@ -409,6 +408,7 @@ def _decode_loop(model, params, cache: KVCache, first_token: jnp.ndarray, steps:
                                      init_carry, xs=None, length=int(steps))
         tokens_seq, logprobs_seq = ys
         return tokens_seq.transpose(1, 0), logprobs_seq.transpose(1, 0)
+    _scan_decode = jax.jit(_scan_decode, donate_argnames=['cache_init'])
 
     offsets = jnp.asarray(rope_deltas if rope_deltas is not None
                          else jnp.zeros((cache.lengths.shape[0], 1), dtype=jnp.int32))
@@ -504,7 +504,6 @@ def sample_streaming(model, params, inputs: Union[VLMInputs, jnp.ndarray, np.nda
                          else jnp.zeros((1, 1), dtype=jnp.int32))
 
     # JIT-compile single decode step for performance
-    @jax.jit(donate_argnames=['cache_state'])
     def _single_step(params, token, cache_state, offsets, rng_key):
         step_mask = jnp.ones((1, 1), dtype=jnp.int32)
         logits, cache_new = model.apply({"params": params}, token, cache_state,
@@ -520,6 +519,7 @@ def sample_streaming(model, params, inputs: Union[VLMInputs, jnp.ndarray, np.nda
             logprob = jnp.float32(0.0)
 
         return next_token[0], logprob, cache_new
+    _single_step = jax.jit(_single_step, donate_argnames=['cache_state'])
 
     # Stream tokens one by one
     stopped = False
