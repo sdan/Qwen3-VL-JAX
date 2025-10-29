@@ -239,6 +239,7 @@ class VLMInputs:
     vision: Union[VisionEmbeddings, jnp.ndarray]  # Vision features
     grid_thw: jnp.ndarray  # [batch, num_images, 3] or [num_images, 3]
     image_pad_id: int  # Token ID for <|image_pad|>
+    vision_start_id: int  # Token ID for <|vision_start|>
 
 
 @dataclass
@@ -310,7 +311,7 @@ def _prefill_text(model, params, tokens: jnp.ndarray, pad_id: int, spec: _RopeSp
 
 
 def _prefill_vlm(model, params, tokens: jnp.ndarray, vision: Union[VisionEmbeddings, jnp.ndarray],
-                grid_thw: jnp.ndarray, image_pad_id: int, pad_id: int, spec: _RopeSpec,
+                grid_thw: jnp.ndarray, image_pad_id: int, vision_start_id: int, pad_id: int, spec: _RopeSpec,
                 max_cache_len: Optional[int]) -> Tuple[jnp.ndarray, KVCache, jnp.ndarray]:
     """Prefill cache for vision-language inputs"""
     if tokens.ndim != 2:
@@ -331,8 +332,14 @@ def _prefill_vlm(model, params, tokens: jnp.ndarray, vision: Union[VisionEmbeddi
 
     # Get mRoPE indices for Qwen3-VL
     from model import get_rope_index
-    pos3, deltas = get_rope_index(spatial_merge_size=model.spec.vision.spatial_merge_size,
-                                  input_ids=tokens, image_grid_thw=grid_thw, attention_mask=mask)
+    pos3, deltas = get_rope_index(
+        spatial_merge_size=model.spec.vision.spatial_merge_size,
+        input_ids=tokens,
+        image_grid_thw=grid_thw,
+        attention_mask=mask,
+        image_token_id=int(image_pad_id) if image_pad_id is not None else None,
+        vision_start_id=int(vision_start_id) if vision_start_id is not None else None,
+    )
 
     cos, sin = build_mrope(pos3, spec.rope_section, spec.rope_theta, spec.dtype,
                           rope_scaling_type=spec.rope_scaling_type,
@@ -432,7 +439,7 @@ def sample(model, params, inputs: Union[VLMInputs, jnp.ndarray, np.ndarray],
     if isinstance(inputs, VLMInputs):
         tokens = jnp.asarray(inputs.prompt_tokens, dtype=jnp.int32)
         _, cache, rope_deltas = _prefill_vlm(model, params, tokens, inputs.vision, inputs.grid_thw,
-                                             inputs.image_pad_id, cfg.pad_id, spec,
+                                             inputs.image_pad_id, inputs.vision_start_id, cfg.pad_id, spec,
                                              max_cache_len=int(tokens.shape[1] + cfg.max_new_tokens))
     else:
         tokens = jnp.asarray(inputs, dtype=jnp.int32)
@@ -480,7 +487,7 @@ def sample_streaming(model, params, inputs: Union[VLMInputs, jnp.ndarray, np.nda
         if tokens.shape[0] != 1:
             raise ValueError("Streaming only supports batch_size=1")
         _, cache, rope_deltas = _prefill_vlm(model, params, tokens, inputs.vision, inputs.grid_thw,
-                                             inputs.image_pad_id, cfg.pad_id, spec,
+                                             inputs.image_pad_id, inputs.vision_start_id, cfg.pad_id, spec,
                                              max_cache_len=int(tokens.shape[1] + cfg.max_new_tokens))
     else:
         tokens = jnp.asarray(inputs, dtype=jnp.int32)

@@ -243,14 +243,18 @@ def build_text_rope(positions: jax.Array, rope_section: Sequence[int], rope_thet
 
 def get_rope_index(spatial_merge_size: int = 2, input_ids: Optional[jax.Array] = None,
                   image_grid_thw: Optional[jax.Array] = None,
-                  attention_mask: Optional[jax.Array] = None) -> Tuple[jax.Array, jax.Array]:
+                  attention_mask: Optional[jax.Array] = None,
+                  image_token_id: Optional[int] = None,
+                  vision_start_id: Optional[int] = None) -> Tuple[jax.Array, jax.Array]:
     """Compute per‑token mRoPE indices for mixed text+vision sequences.
 
     Returns position_ids [3, B, T] and per‑batch offsets `deltas` to align
     decode‑time positions with prefill length. Text tokens get 1D positions
     broadcast to 3 axes; vision tokens use true (t,h,w) grid indices.
     """
-    IMAGE_TOKEN_ID, VISION_START_ID = 151655, 151652
+    # Prefer caller-provided special token IDs; fall back to legacy constants
+    IMAGE_TOKEN_ID = int(image_token_id) if image_token_id is not None else 151655
+    VISION_START_ID = int(vision_start_id) if vision_start_id is not None else 151652
     batch, seq_len = (input_ids.shape if input_ids is not None
                      else (attention_mask.shape[0] if attention_mask is not None else (1, 1)))
 

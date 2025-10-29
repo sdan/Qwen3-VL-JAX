@@ -87,6 +87,7 @@ def main(cfg: Config) -> None:
 
     # Get special token IDs
     image_pad_id = tokenizer.convert_tokens_to_ids("<|image_pad|>")
+    vision_start_id = tokenizer.convert_tokens_to_ids("<|vision_start|>")
     eos_id = tokenizer.eos_token_id
     pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
 
@@ -105,6 +106,7 @@ def main(cfg: Config) -> None:
         vision=vision_embeddings,
         grid_thw=grid_thw,
         image_pad_id=image_pad_id,
+        vision_start_id=vision_start_id,
     )
 
     # Generate
