@@ -26,7 +26,8 @@ A minimal, readable implementation of Qwen3‑VL inference in JAX/Flax(no PyTorc
 - Clone and convert HuggingFace weights to JAX
   - `git clone https://github.com/sdan/Qwen3-VL-JAX.git && cd Qwen3-VL-JAX`
   - `huggingface-cli download Qwen/Qwen3-VL-2B-Instruct --local-dir checkpoints/qwen3vl_2b`
-  - `uv sync`
+  - `uv sync` (CPU/default)
+  - For CUDA 12 GPU support: `uv sync --extra cuda12`
   - `uv run python -c "from utils import convert_hf_to_jax; convert_hf_to_jax('qwen3vl','./checkpoints/qwen3vl_2b')"`
 
 - Run inference (CLI)
