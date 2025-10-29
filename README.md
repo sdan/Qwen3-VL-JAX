@@ -30,8 +30,11 @@ A minimal, readable implementation of Qwen3‑VL inference in JAX/Flax(no PyTorc
   - `uv run python -c "from utils import convert_hf_to_jax; convert_hf_to_jax('qwen3vl','./checkpoints/qwen3vl_2b')"`
 
 - Run inference (CLI)
-  - `uv run python run.py --image examples/imgs/demo.jpg --prompt "What is in this image?"`
-  - With overrides: `uv run python run.py --image examples/imgs/demo.jpg --prompt "Describe this" model.model_dir=./checkpoints/qwen3vl_2b sampling.temperature=0.8 sampling.max_new_tokens=256`
+  - `uv run python run.py inference.image=examples/imgs/panda_climbing.png`
+  - With custom prompt: `uv run python run.py inference.image=examples/imgs/panda_climbing.png inference.prompt="What is in this image?"`
+  - With overrides: `uv run python run.py inference.image=examples/imgs/panda_climbing.png inference.prompt="Describe this" model.model_dir=./checkpoints/qwen3vl_2b sampling.temperature=0.8 sampling.max_new_tokens=256`
+  - CUDA (opinionated): `JAX_PLATFORMS=gpu,cpu uv run python run.py inference.image=examples/imgs/panda_climbing.png inference.device=cuda sampling.max_new_tokens=256`
+    - Prints tokens/sec; keeps params, prefill, and decode on GPU.
 
 ## Minimal Example
 
@@ -49,7 +52,7 @@ pixel_values, grid_thw = preprocess_image("image.jpg",
     spatial_merge_size=model.spec.vision.spatial_merge_size,
     temporal_patch_size=model.spec.vision.temporal_patch_size)
 
-vision_emb = model.apply({"params": params}, pixel_values[None], grid_thw[None], method=model.encode_vision)
+vision_emb = model.apply({"params": params}, pixel_values, grid_thw, method=model.encode_vision)
 num_vision_tokens = vision_emb.tokens.shape[1]
 prompt = chat_prompt_with_image(num_vision_tokens, "What is in this image?")
 prompt_tokens = tokenizer.encode(prompt, add_special_tokens=False)

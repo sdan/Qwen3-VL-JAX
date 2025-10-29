@@ -298,7 +298,7 @@ def _prefill_text(model, params, tokens: jnp.ndarray, pad_id: int, spec: _RopeSp
                                rope_scaling_factor=spec.rope_scaling_factor)
     cache = _init_cache(spec, tokens.shape[0], int(max_cache_len or tokens.shape[1]))
 
-    @jax.jit
+    @jax.jit(donate_argnums=(5,))
     def _prefill(params, tokens, cos, sin, mask, cache):
         _, cache_out = model.apply({"params": params}, tokens, cos, sin, mask=mask, cache=cache,
                                   method=model.forward_text)
@@ -348,7 +348,7 @@ def _prefill_vlm(model, params, tokens: jnp.ndarray, vision: Union[VisionEmbeddi
         vision_arr = jnp.asarray(vision, dtype=spec.dtype)
         vision_pack = VisionEmbeddings(tokens=vision_arr, deepstack=())
 
-    @jax.jit
+    @jax.jit(donate_argnums=(7,))
     def _prefill(params, tokens, vision_pack, image_pad_id, cos, sin, mask, cache):
         logits, cache_out = model.apply({"params": params}, tokens, vision_pack, image_pad_id,
                                         cos, sin, mask=mask, cache=cache, method=model.forward_vlm)
@@ -375,7 +375,7 @@ def _decode_loop(model, params, cache: KVCache, first_token: jnp.ndarray, steps:
     use_top_k = int(top_k) if top_k is not None else 0
     topp_val = float(top_p) if (top_p and 0.0 < float(top_p) < 1.0) else None
 
-    @jax.jit
+    @jax.jit(donate_argnums=(2,))
     def _scan_decode(params, offsets, cache_init, first_tok, rng_init):
         def _one_step(params, offsets, carry, _):
             cache_state, current_tok, rng_state, stopped = carry
@@ -461,8 +461,100 @@ def sample(model, params, inputs: Union[VLMInputs, jnp.ndarray, np.ndarray],
     return SampleResult(tokens=new_tokens, logprobs=new_logprobs, texts=texts)
 
 
+def sample_streaming(model, params, inputs: Union[VLMInputs, jnp.ndarray, np.ndarray],
+                    cfg: SamplingConfig, rng: jax.Array, tokenizer=None, return_logprobs: bool = False):
+    """Streaming sampling that yields tokens one at a time
+
+    Accepts either:
+    - VLMInputs for vision-language sampling
+    - jnp.ndarray/np.ndarray [B, T] for text-only sampling
+
+    Yields tuples of (token, text, logprob) for each generated token.
+    Note: Only supports batch_size=1 for streaming.
+    """
+    spec = _rope_spec_from_model(model)
+
+    # Determine input type and prefill
+    if isinstance(inputs, VLMInputs):
+        tokens = jnp.asarray(inputs.prompt_tokens, dtype=jnp.int32)
+        if tokens.shape[0] != 1:
+            raise ValueError("Streaming only supports batch_size=1")
+        _, cache, rope_deltas = _prefill_vlm(model, params, tokens, inputs.vision, inputs.grid_thw,
+                                             inputs.image_pad_id, cfg.pad_id, spec,
+                                             max_cache_len=int(tokens.shape[1] + cfg.max_new_tokens))
+    else:
+        tokens = jnp.asarray(inputs, dtype=jnp.int32)
+        if tokens.shape[0] != 1:
+            raise ValueError("Streaming only supports batch_size=1")
+        cache, rope_deltas = _prefill_text(model, params, tokens, cfg.pad_id, spec,
+                                          max_cache_len=int(tokens.shape[1] + cfg.max_new_tokens))
+
+    # Get last non-pad token
+    lengths = cache.lengths.astype(jnp.int32)
+    last_idx = jnp.maximum(lengths - 1, 0)
+    current_token = jnp.take_along_axis(tokens, last_idx[:, None], axis=1).squeeze(1)
+
+    # Setup parameters
+    temp = jnp.float32(cfg.temperature)
+    eos_scalar = jnp.int32(cfg.eos_id if cfg.eos_id is not None else -1)
+    has_eos = eos_scalar >= 0
+    use_top_k = int(cfg.top_k) if cfg.top_k is not None else 0
+    topp_val = float(cfg.top_p) if (cfg.top_p and 0.0 < float(cfg.top_p) < 1.0) else None
+    offsets = jnp.asarray(rope_deltas if rope_deltas is not None
+                         else jnp.zeros((1, 1), dtype=jnp.int32))
+
+    # JIT-compile single decode step for performance
+    @jax.jit(donate_argnums=(2,))
+    def _single_step(params, token, cache_state, offsets, rng_key):
+        step_mask = jnp.ones((1, 1), dtype=jnp.int32)
+        logits, cache_new = model.apply({"params": params}, token, cache_state,
+                                        offsets, step_mask, method=model.decode_step)
+        logits = logits.astype(jnp.float32) / temp
+        masked = mask_logits_topk_topp(logits, top_k=use_top_k, top_p=topp_val)
+        next_token = jax.random.categorical(rng_key, masked)
+
+        if return_logprobs:
+            log_probs = jax.nn.log_softmax(masked)
+            logprob = log_probs[0, next_token[0]]
+        else:
+            logprob = jnp.float32(0.0)
+
+        return next_token[0], logprob, cache_new
+
+    # Stream tokens one by one
+    stopped = False
+    for step in range(int(cfg.max_new_tokens)):
+        if stopped:
+            break
+
+        rng, step_key = jax.random.split(rng)
+        next_token, logprob, cache = _single_step(params, current_token, cache, offsets, step_key)
+
+        # Convert to Python int
+        token_id = int(next_token)
+        logprob_val = float(logprob) if return_logprobs else None
+
+        # Check for EOS
+        if has_eos and token_id == int(eos_scalar):
+            stopped = True
+
+        # Decode token to text
+        text = ""
+        if tokenizer is not None:
+            try:
+                text = tokenizer.decode([token_id], skip_special_tokens=False)
+            except Exception:
+                text = ""
+
+        # Yield result
+        yield (token_id, text, logprob_val)
+
+        # Update current token for next iteration
+        current_token = jnp.array([token_id], dtype=jnp.int32)
+
+
 __all__ = [
     "SamplingConfig", "VLMInputs", "SampleResult",
     "preprocess_image", "chat_prompt_with_image", "chat_prompt_with_images",
-    "extract_assistant", "sample",
+    "extract_assistant", "sample", "sample_streaming",
 ]

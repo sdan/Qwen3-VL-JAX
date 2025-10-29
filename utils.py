@@ -233,6 +233,17 @@ class LoggingConfig:
 
 
 @chz.chz
+class InferenceConfig:
+    """Inference-specific configuration"""
+    image: str | None = None
+    """Path to image file"""
+    prompt: str = "What is shown in this image?"
+    """Text prompt for the model"""
+    device: str = "auto"
+    """Device preference: auto|cpu|cuda(gpu)"""
+
+
+@chz.chz
 class Config:
     """Root configuration container
 
@@ -250,6 +261,7 @@ class Config:
     sampling: SamplingConfig
     training: TrainingConfig
     logging: LoggingConfig
+    inference: InferenceConfig
 
 
 def run_with_config(main_fn):
@@ -353,6 +365,6 @@ def convert_hf_to_jax(model_type: str, model_dir: str, hf_dir: Optional[str] = N
 __all__ = [
     "setup_logger", "get_logger", "LoggerContext",
     "Checkpoint",
-    "Config", "ModelConfig", "SamplingConfig", "TrainingConfig", "LoggingConfig",
+    "Config", "ModelConfig", "SamplingConfig", "TrainingConfig", "LoggingConfig", "InferenceConfig",
     "run_with_config", "convert_hf_to_jax",
 ]

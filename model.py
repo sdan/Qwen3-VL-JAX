@@ -168,14 +168,20 @@ def apply_multimodal_rotary_pos_emb(q: jax.Array, k: jax.Array, cos: jax.Array,
     total_dim = sum(sections)
 
     def _reorder(table: jax.Array) -> jax.Array:
-        """Interleave sections for mRoPE"""
+        """Interleave sections for mRoPE - extract each section from its corresponding axis"""
+        # table shape: [axes, B, T, 2*total_dim]
+        # Extract the relevant section from each axis and concatenate
         chunks = []
-        for _ in range(2):  # cos then sin parts
-            for sec in sections:
-                chunks.append(table[..., len(chunks) // 2 * total_dim + len(chunks) % 2 * sec:
-                                    len(chunks) // 2 * total_dim + (len(chunks) % 2 + 1) * sec])
-        return jnp.concatenate([chunks[i % len(sections) + (i // len(sections)) * len(sections)]
-                               for i in range(len(chunks))], axis=-1)
+        for axis_idx, sec in enumerate(sections):
+            axis_table = table[axis_idx, ...]  # [B, T, 2*total_dim]
+            offset = sum(sections[:axis_idx])
+            # Extract from first half (the two halves are duplicates from build_mrope)
+            chunk = axis_table[..., offset:offset+sec]
+            chunks.append(chunk)
+        # Concatenate: [B, T, total_dim]
+        reordered = jnp.concatenate(chunks, axis=-1)
+        # Duplicate to get 2*total_dim (for rotate_half to work correctly)
+        return jnp.concatenate([reordered, reordered], axis=-1)
 
     cos_flat = _reorder(cos).astype(q.dtype)
     sin_flat = _reorder(sin).astype(q.dtype)
@@ -442,15 +448,6 @@ class MultiHeadAttention(nn.Module):
         return out, cache
 
 
-# ----------------------------------------------------------------------------
-# Aliases for readability (no behavior change)
-# ----------------------------------------------------------------------------
-MLP = FeedForward
-CausalSelfAttention = MultiHeadAttention
-Block = DecoderBlock
-
-
-
 class DecoderBlock(nn.Module):
     hidden_size: int
     num_heads: int
@@ -475,6 +472,14 @@ class DecoderBlock(nn.Module):
         x = x + attn_out
         x = x + self.mlp(self.post_norm(x))
         return x, cache
+
+
+# ----------------------------------------------------------------------------
+# Aliases for readability (no behavior change)
+# ----------------------------------------------------------------------------
+MLP = FeedForward
+CausalSelfAttention = MultiHeadAttention
+Block = DecoderBlock
 
 
 # ============================================================================
@@ -989,8 +994,19 @@ def create_model_from_ckpt(ckpt_dir: str) -> tuple[Qwen3VLModel, dict]:
     cfg = _load_hf_config(ckpt_dir)
     spec = spec_from_config(cfg)
     model = Qwen3VLModel(spec)
-    with open(f"{ckpt_dir}/params.pkl", "rb") as f:
-        params = pickle.load(f)["params"]
+    params_path = f"{ckpt_dir}/params.pkl"
+    try:
+        with open(params_path, "rb") as f:
+            params = pickle.load(f)["params"]
+    except jax.errors.JaxRuntimeError as err:
+        if "default_memory_space" not in str(err):
+            raise
+        cpu_devices = jax.devices("cpu")
+        if not cpu_devices:
+            raise
+        # Fallback to loading params on CPU when Metal backend lacks memory space support.
+        with open(params_path, "rb") as f, jax.default_device(cpu_devices[0]):
+            params = pickle.load(f)["params"]
     return model, params
 
 

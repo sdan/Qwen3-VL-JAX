@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Simple Qwen3-VL inference script
+"""Qwen3-VL streaming inference demo
+
+Demonstrates real-time token-by-token generation.
 
 Usage:
-    python run.py inference.image=path/to/image.jpg
-    python run.py inference.image=image.jpg inference.prompt="What is in this image?"
-    python run.py inference.image=image.jpg model.model_dir=./my_checkpoint sampling.temperature=0.8
+    python run_streaming.py inference.image=path/to/image.jpg
+    python run_streaming.py inference.image=image.jpg inference.prompt="What is in this image?"
 """
 from __future__ import annotations
 
@@ -15,20 +16,19 @@ from transformers import AutoTokenizer
 import time
 
 from model import create_model_from_ckpt
-from sample import (SamplingConfig, VLMInputs, sample, preprocess_image,
-                   chat_prompt_with_image, extract_assistant)
+from sample import (SamplingConfig, VLMInputs, sample_streaming, preprocess_image,
+                   chat_prompt_with_image)
 from utils import Config, setup_logger
 
 
 def main(cfg: Config) -> None:
     # Validate image path
     if cfg.inference.image is None:
-        raise ValueError("inference.image is required. Usage: python run.py inference.image=path/to/image.jpg")
+        raise ValueError("inference.image is required. Usage: python run_streaming.py inference.image=path/to/image.jpg")
 
     # Setup logger
     logger = setup_logger(__name__, level=cfg.logging.log_level,
                          log_file=cfg.logging.log_file, verbose=cfg.logging.verbose)
-
     # Device preference (only acts on CUDA; no MPS juggling)
     dev_pref = str(getattr(cfg.inference, "device", "auto")).lower()
     chosen = None
@@ -107,31 +107,31 @@ def main(cfg: Config) -> None:
         image_pad_id=image_pad_id,
     )
 
-    # Generate
-    logger.info("Generating response...")
-    rng = jax.random.PRNGKey(cfg.sampling.seed)
-    t0 = time.perf_counter()
-    result = sample(model, params, inputs, sampling_cfg, rng, tokenizer=tokenizer)
-    t1 = time.perf_counter()
+    # Generate with streaming
+    print("\n" + "=" * 60)
+    print("STREAMING RESPONSE:")
+    print("=" * 60)
 
-    # Extract and display
-    response_text = result.texts[0] if result.texts else ""
-    assistant_response = extract_assistant(response_text)
+    rng = jax.random.PRNGKey(cfg.sampling.seed)
+
+    # Track tokens for debugging
+    all_tokens = []
+    t0 = time.perf_counter()
+
+    for token_id, text, logprob in sample_streaming(model, params, inputs, sampling_cfg, rng,
+                                                     tokenizer=tokenizer, return_logprobs=False):
+        # Print token in real-time (flush immediately)
+        print(text, end='', flush=True)
+        all_tokens.append(token_id)
 
     print("\n" + "=" * 60)
-    print("RESPONSE:")
-    print("=" * 60)
-    print(assistant_response)
-    print("=" * 60)
-
-    # Throughput summary
-    try:
-        new_toks = int(result.tokens.shape[1])
-    except Exception:
-        new_toks = 0
+    t1 = time.perf_counter()
     elapsed = max(t1 - t0, 1e-6)
-    tok_s = new_toks / elapsed if new_toks else 0.0
-    print(f"Throughput: {tok_s:.2f} tok/s ({new_toks} tokens in {elapsed:.2f}s)")
+    total = len(all_tokens)
+    tok_s = total / elapsed if total else 0.0
+    print(f"Generated {total} tokens")
+    print(f"Throughput: {tok_s:.2f} tok/s ({total} tokens in {elapsed:.2f}s)")
+    print("=" * 60)
 
 
 if __name__ == "__main__":
