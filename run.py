@@ -77,7 +77,11 @@ def main(cfg: Config) -> None:
         grid_thw,
         method=model.encode_vision,
     )
-    num_vision_tokens = vision_embeddings.tokens.shape[1]
+    # VisionEmbeddings.tokens is [seq, dim] or [batch, seq, dim]. We need the seq length.
+    if vision_embeddings.tokens.ndim == 2:
+        num_vision_tokens = int(vision_embeddings.tokens.shape[0])
+    else:
+        num_vision_tokens = int(vision_embeddings.tokens.shape[1])
     logger.info(f"Vision tokens: {num_vision_tokens}")
 
     # Format prompt
@@ -88,7 +92,9 @@ def main(cfg: Config) -> None:
     # Get special token IDs
     image_pad_id = tokenizer.convert_tokens_to_ids("<|image_pad|>")
     vision_start_id = tokenizer.convert_tokens_to_ids("<|vision_start|>")
-    eos_id = tokenizer.eos_token_id
+    # Prefer terminating the assistant turn on <|im_end|> for chat-style decoding
+    im_end_id = tokenizer.convert_tokens_to_ids("<|im_end|>")
+    eos_id = im_end_id if im_end_id is not None and int(im_end_id) >= 0 else tokenizer.eos_token_id
     pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
 
     # Prepare inputs
