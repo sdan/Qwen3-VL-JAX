@@ -89,11 +89,3 @@ I saw ThinkingMachines use chz so I decided to make it first-class. This also al
 `uv run python run.py --image img.jpg sampling.temperature=0.95 sampling.max_new_tokens=512 model.dtype=float32`
 
 Most of this code was taken from (sdan/vlm-gym)[https://github.com/sdan/vlm-gym] as an attempt to cleanly abstract it out to sample from the policy optimization loop. As mentioned previously the impetus was mainly I couldnt find a KV Cache impl of the Qwen vision models so I wrote this, your main contribution would ideally be on speed-up optimizations; thanks!
-
-
-
-
-## Credits
-
-- Qwen team (model)
-- Checkpoint helpers adapted from community projects listed in code
