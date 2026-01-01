@@ -13,7 +13,7 @@ A minimal, readable implementation of Qwen3‑VL inference in JAX/Flax(no PyTorc
 - Decode ~30 ms/token (~33 tok/s)
 - ~6 GB total memory (weights+cache+acts)
 
-## Qwen3-VL-4B Card (default):
+## Qwen3-VL-2B Card (default):
 
 - Decoder: Transformer with GQA; depth/width taken from HF config
 - Vision: ViT with window attention and 2×2 spatial merge
@@ -24,18 +24,32 @@ A minimal, readable implementation of Qwen3‑VL inference in JAX/Flax(no PyTorc
 ## Quickstart
 
 - Clone and convert HuggingFace weights to JAX
-  - `git clone https://github.com/sdan/Qwen3-VL-JAX.git && cd Qwen3-VL-JAX`
-  - `huggingface-cli download Qwen/Qwen3-VL-4B-Instruct --local-dir checkpoints/qwen3vl_4b`
-  - `uv sync` (CPU/default)
-  - For CUDA 12 GPU support: `uv sync --extra cuda12`
-  - `uv run python -c "from utils import convert_hf_to_jax; convert_hf_to_jax('qwen3vl','./checkpoints/qwen3vl_4b')"`
+  ```bash
+  git clone https://github.com/sdan/Qwen3-VL-JAX.git && cd Qwen3-VL-JAX
+  uv sync  # CPU/default (use `uv sync --extra cuda12` for CUDA 12)
+
+  # Download and convert weights (2B default)
+  uv run huggingface-cli download Qwen/Qwen3-VL-2B-Instruct --local-dir checkpoints/qwen3vl_2b
+  uv run python -c "from utils import convert_hf_to_jax; convert_hf_to_jax('qwen3vl','./checkpoints/qwen3vl_2b')"
+  ```
 
 - Run inference (CLI)
-  - `uv run python run.py inference.image=examples/imgs/panda_climbing.png`
-  - With custom prompt: `uv run python run.py inference.image=examples/imgs/panda_climbing.png inference.prompt="What is in this image?"`
-  - With overrides: `uv run python run.py inference.image=examples/imgs/panda_climbing.png inference.prompt="Describe this" model.model_dir=./checkpoints/qwen3vl_4b sampling.temperature=0.8 sampling.max_new_tokens=256`
-  - CUDA (opinionated): `JAX_PLATFORMS=gpu,cpu uv run python run.py inference.image=examples/imgs/panda_climbing.png inference.device=cuda sampling.max_new_tokens=256`
-    - Prints tokens/sec; keeps params, prefill, and decode on GPU.
+  ```bash
+  # Basic (default prompt: "What is shown in this image?")
+  uv run python run.py inference.image=examples/imgs/horses.png
+
+  # Custom prompt
+  uv run python run.py inference.image=examples/imgs/horses.png inference.prompt="Describe this"
+
+  # Streaming (tokens appear as generated)
+  uv run python run.py inference.image=examples/imgs/horses.png inference.stream=true
+
+  # Sampling params
+  uv run python run.py inference.image=examples/imgs/horses.png sampling.temperature=0.8 sampling.max_new_tokens=256
+
+  # CUDA
+  JAX_PLATFORMS=gpu,cpu uv run python run.py inference.image=examples/imgs/horses.png inference.device=cuda
+  ```
 
 ## Minimal Example
 

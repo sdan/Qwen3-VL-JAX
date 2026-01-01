@@ -179,7 +179,7 @@ class Checkpoint:
 @chz.chz
 class ModelConfig:
     """Model loading configuration"""
-    model_dir: str = "checkpoints/qwen3vl_4b"
+    model_dir: str = "checkpoints/qwen3vl_2b"
     """Path to checkpoint directory"""
     dtype: str = "bfloat16"
     """Model dtype: bfloat16, float32, or float16"""
@@ -241,6 +241,8 @@ class InferenceConfig:
     """Text prompt for the model"""
     device: str = "auto"
     """Device preference: auto|cpu|cuda(gpu)"""
+    stream: bool = False
+    """Stream tokens one at a time instead of returning all at once"""
 
 
 @chz.chz

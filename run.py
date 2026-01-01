@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Simple Qwen3-VL inference script
+"""Qwen3-VL inference
 
 Usage:
     python run.py inference.image=path/to/image.jpg
     python run.py inference.image=image.jpg inference.prompt="What is in this image?"
-    python run.py inference.image=image.jpg model.model_dir=./my_checkpoint sampling.temperature=0.8
+    python run.py inference.image=image.jpg inference.stream=true
+    python run.py inference.image=image.jpg sampling.temperature=0.8 sampling.max_new_tokens=256
 """
 from __future__ import annotations
 
@@ -15,8 +16,8 @@ from transformers import AutoTokenizer
 import time
 
 from model import create_model_from_ckpt
-from sample import (SamplingConfig, VLMInputs, sample, preprocess_image,
-                   chat_prompt_with_image, extract_assistant)
+from sample import (SamplingConfig, VLMInputs, sample, sample_streaming,
+                   preprocess_image, chat_prompt_with_image, extract_assistant)
 from utils import Config, setup_logger
 
 
@@ -116,37 +117,53 @@ def main(cfg: Config) -> None:
     )
 
     # Generate
-    logger.info("Generating response...")
     rng = jax.random.PRNGKey(cfg.sampling.seed)
     t0 = time.perf_counter()
-    result = sample(model, params, inputs, sampling_cfg, rng, tokenizer=tokenizer)
-    t1 = time.perf_counter()
 
-    # Extract and display
-    # Decode using full prompt + generated tokens so extract_assistant can find markers.
-    try:
-        new_ids = result.tokens[0].tolist()
-        full_ids = prompt_tokens + new_ids
-        full_text = tokenizer.decode(full_ids, skip_special_tokens=False, clean_up_tokenization_spaces=False)
-    except Exception:
-        full_text = result.texts[0] if result.texts else ""
+    if cfg.inference.stream:
+        # Streaming: print tokens as they're generated
+        logger.info("Streaming response...")
+        print("\n" + "=" * 60)
+        print("RESPONSE:")
+        print("=" * 60)
 
-    assistant_response = extract_assistant(full_text)
-    if not assistant_response:
-        # Fallback: show decoded new tokens only (without special tokens)
-        assistant_response = (result.texts[0] if result.texts else "").strip()
+        all_tokens = []
+        for token_id, text, _ in sample_streaming(model, params, inputs, sampling_cfg, rng, tokenizer=tokenizer):
+            print(text, end='', flush=True)
+            all_tokens.append(token_id)
 
-    print("\n" + "=" * 60)
-    print("RESPONSE:")
-    print("=" * 60)
-    print(assistant_response)
-    print("=" * 60)
+        print("\n" + "=" * 60)
+        t1 = time.perf_counter()
+        new_toks = len(all_tokens)
+    else:
+        # Batch: generate all tokens then display
+        logger.info("Generating response...")
+        result = sample(model, params, inputs, sampling_cfg, rng, tokenizer=tokenizer)
+        t1 = time.perf_counter()
 
-    # Throughput summary
-    try:
-        new_toks = int(result.tokens.shape[1])
-    except Exception:
-        new_toks = 0
+        # Extract and display
+        try:
+            new_ids = result.tokens[0].tolist()
+            full_ids = prompt_tokens + new_ids
+            full_text = tokenizer.decode(full_ids, skip_special_tokens=False, clean_up_tokenization_spaces=False)
+        except Exception:
+            full_text = result.texts[0] if result.texts else ""
+
+        assistant_response = extract_assistant(full_text)
+        if not assistant_response:
+            assistant_response = (result.texts[0] if result.texts else "").strip()
+
+        print("\n" + "=" * 60)
+        print("RESPONSE:")
+        print("=" * 60)
+        print(assistant_response)
+        print("=" * 60)
+
+        try:
+            new_toks = int(result.tokens.shape[1])
+        except Exception:
+            new_toks = 0
+
     elapsed = max(t1 - t0, 1e-6)
     tok_s = new_toks / elapsed if new_toks else 0.0
     print(f"Throughput: {tok_s:.2f} tok/s ({new_toks} tokens in {elapsed:.2f}s)")
