@@ -18,8 +18,9 @@ from model import KVCache, VisionEmbeddings, build_mrope, build_text_rope
 # Image preprocessing
 # ============================================================================
 
-CLIP_MEAN = np.array([0.48145466, 0.4578275, 0.40821073], dtype=np.float32)
-CLIP_STD = np.array([0.26862954, 0.26130258, 0.27577711], dtype=np.float32)
+# Qwen3-VL uses simple normalization: (x - 0.5) / 0.5 = 2x - 1, mapping [0,1] to [-1,1]
+IMAGE_MEAN = np.array([0.5, 0.5, 0.5], dtype=np.float32)
+IMAGE_STD = np.array([0.5, 0.5, 0.5], dtype=np.float32)
 DEFAULT_MIN_PIXELS = 56 * 56
 DEFAULT_MAX_PIXELS = 12845056
 
@@ -81,9 +82,9 @@ def preprocess_image(image: Union[str, Any], patch_size: int, spatial_merge_size
     if (new_w, new_h) != (width, height):
         pil_img = pil_img.resize((new_w, new_h), Image.Resampling.BICUBIC)
 
-    # Normalize [0,255] -> CLIP normalized
+    # Normalize [0,255] -> [-1, 1]
     image_np = np.asarray(pil_img, dtype=np.float32) / 255.0
-    image_np = (image_np - CLIP_MEAN) / CLIP_STD
+    image_np = (image_np - IMAGE_MEAN) / IMAGE_STD
 
     # CHW + temporal axis
     image_np = np.transpose(image_np, (2, 0, 1))[None, ...]  # (1, C, H, W)
@@ -265,6 +266,7 @@ class _RopeSpec:
     num_layers: int
     num_kv_heads: int
     head_dim: int
+    mrope_interleaved: bool
 
 
 def _rope_spec_from_model(model) -> _RopeSpec:
@@ -279,6 +281,7 @@ def _rope_spec_from_model(model) -> _RopeSpec:
         num_layers=int(text_spec.num_hidden_layers),
         num_kv_heads=int(text_spec.num_key_value_heads),
         head_dim=int(text_spec.head_dim),
+        mrope_interleaved=bool(getattr(text_spec, "mrope_interleaved", False)),
     )
 
 
@@ -296,7 +299,8 @@ def _prefill_text(model, params, tokens: jnp.ndarray, pad_id: int, spec: _RopeSp
     positions, mask = token_positions(tokens, pad_id)
     cos, sin = build_text_rope(positions, spec.rope_section, spec.rope_theta, spec.dtype,
                                rope_scaling_type=spec.rope_scaling_type,
-                               rope_scaling_factor=spec.rope_scaling_factor)
+                               rope_scaling_factor=spec.rope_scaling_factor,
+                               mrope_interleaved=spec.mrope_interleaved)
     cache = _init_cache(spec, tokens.shape[0], int(max_cache_len or tokens.shape[1]))
 
     def _prefill(params, tokens, cos, sin, mask, cache):
@@ -343,7 +347,8 @@ def _prefill_vlm(model, params, tokens: jnp.ndarray, vision: Union[VisionEmbeddi
 
     cos, sin = build_mrope(pos3, spec.rope_section, spec.rope_theta, spec.dtype,
                           rope_scaling_type=spec.rope_scaling_type,
-                          rope_scaling_factor=spec.rope_scaling_factor)
+                          rope_scaling_factor=spec.rope_scaling_factor,
+                          mrope_interleaved=spec.mrope_interleaved)
 
     max_len = int(max_cache_len or tokens.shape[1])
     cache = _init_cache(spec, batch, max_len)

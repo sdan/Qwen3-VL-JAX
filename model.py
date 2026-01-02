@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from typing import Any, List, Optional, Sequence, Tuple, Union
 
 import flax, flax.linen as nn, jax, jax.numpy as jnp
+import numpy as np
 from flax import struct
 from safetensors import safe_open
 
@@ -164,6 +165,13 @@ def apply_multimodal_rotary_pos_emb(q: jax.Array, k: jax.Array, cos: jax.Array,
         interleaved mRoPE is used by config, only the rotary span is rotated
         and the pass‑through span is concatenated unchanged.
     """
+    if cos.ndim == 3:
+        cos_embed = jnp.expand_dims(cos, axis=unsqueeze_dim).astype(q.dtype)
+        sin_embed = jnp.expand_dims(sin, axis=unsqueeze_dim).astype(q.dtype)
+        q_embed = q * cos_embed + rotate_half(q) * sin_embed
+        k_embed = k * cos_embed + rotate_half(k) * sin_embed
+        return q_embed, k_embed
+
     sections = tuple(int(x) for x in rope_section)
     total_dim = sum(sections)
 
@@ -202,9 +210,25 @@ def apply_multimodal_rotary_pos_emb(q: jax.Array, k: jax.Array, cos: jax.Array,
     return q_embed, k_embed
 
 
+def _apply_interleaved_mrope(freqs: jax.Array, rope_section: Sequence[int]) -> jax.Array:
+    """Interleave (t,h,w) rotary freqs into a single axis layout."""
+    if freqs.shape[0] < 3 or len(tuple(rope_section)) < 3:
+        return freqs[0]
+    freqs_t = freqs[0]
+    for axis_idx, offset in enumerate((1, 2), start=1):
+        length = int(rope_section[axis_idx]) * 3
+        if length <= offset:
+            continue
+        idx = jnp.arange(offset, length, 3)
+        mask = jnp.zeros((freqs_t.shape[-1],), dtype=jnp.bool_).at[idx].set(True)
+        freqs_t = jnp.where(mask[None, None, :], freqs[axis_idx], freqs_t)
+    return freqs_t
+
+
 def build_mrope(position_ids_axes: jax.Array, rope_section: Sequence[int], rope_theta: float,
                 dtype: DType = jnp.bfloat16, rope_scaling_type: Optional[str] = None,
-                rope_scaling_factor: Optional[float] = None) -> tuple[jax.Array, jax.Array]:
+                rope_scaling_factor: Optional[float] = None,
+                mrope_interleaved: bool = False) -> tuple[jax.Array, jax.Array]:
     """Build 3D mRoPE tables for (t, h, w) axes.
 
     Args:
@@ -225,20 +249,27 @@ def build_mrope(position_ids_axes: jax.Array, rope_section: Sequence[int], rope_
     total_dim = sum(sections)
     inv_freq = 1.0 / (rope_theta ** (jnp.arange(total_dim, dtype=jnp.float32) / total_dim))
     freqs = jnp.einsum("sbn,k->sbnk", pos, inv_freq, precision=jax.lax.Precision.HIGHEST)
+    if mrope_interleaved:
+        freqs = _apply_interleaved_mrope(freqs, sections)
+        emb = jnp.concatenate([freqs, freqs], axis=-1)
+        return jnp.cos(emb).astype(dtype), jnp.sin(emb).astype(dtype)
+
     emb = jnp.concatenate([freqs, freqs], axis=-1)
     return jnp.cos(emb).astype(dtype), jnp.sin(emb).astype(dtype)
 
 
 def build_text_rope(positions: jax.Array, rope_section: Sequence[int], rope_theta: float,
                    dtype: DType = jnp.bfloat16, rope_scaling_type: Optional[str] = None,
-                   rope_scaling_factor: Optional[float] = None) -> tuple[jax.Array, jax.Array]:
+                   rope_scaling_factor: Optional[float] = None,
+                   mrope_interleaved: bool = False) -> tuple[jax.Array, jax.Array]:
     """Classic 1D RoPE for text tokens.
 
     positions: [B, T] -> we broadcast to 3 axes to share codepath with mRoPE.
     """
     axes = len(tuple(rope_section))
     pos_axes = jnp.broadcast_to(positions[None, ...], (axes,) + positions.shape)
-    return build_mrope(pos_axes, rope_section, rope_theta, dtype, rope_scaling_type, rope_scaling_factor)
+    return build_mrope(pos_axes, rope_section, rope_theta, dtype, rope_scaling_type,
+                       rope_scaling_factor, mrope_interleaved)
 
 
 def get_rope_index(spatial_merge_size: int = 2, input_ids: Optional[jax.Array] = None,
@@ -339,6 +370,22 @@ class RMSNorm(nn.Module):
     def __call__(self, x: jax.Array) -> jax.Array:
         gamma = self.param("weight", nn.initializers.ones, (self.hidden_size,), self.dtype)
         return rms_norm(x, gamma, self.eps)
+
+
+class LayerNorm(nn.Module):
+    hidden_size: int
+    eps: float
+    dtype: DType = jnp.bfloat16
+
+    @nn.compact
+    def __call__(self, x: jax.Array) -> jax.Array:
+        weight = self.param("weight", nn.initializers.ones, (self.hidden_size,), self.dtype)
+        bias = self.param("bias", nn.initializers.zeros, (self.hidden_size,), self.dtype)
+        x_f32 = x.astype(jnp.float32)
+        mean = jnp.mean(x_f32, axis=-1, keepdims=True)
+        var = jnp.mean((x_f32 - mean) ** 2, axis=-1, keepdims=True)
+        normed = (x_f32 - mean) * jax.lax.rsqrt(var + self.eps)
+        return (normed * weight + bias).astype(x.dtype)
 
 
 class FeedForward(nn.Module):
@@ -495,7 +542,7 @@ class VisionRotaryEmbedding(nn.Module):
     theta: float = 10000.0
 
     def __call__(self, seq_len: int) -> jax.Array:
-        inv_freq = 1.0 / (self.theta ** (jnp.arange(self.dim, dtype=jnp.float32) / self.dim))
+        inv_freq = 1.0 / (self.theta ** (jnp.arange(0, self.dim, 2, dtype=jnp.float32) / self.dim))
         return jnp.outer(jnp.arange(seq_len, dtype=jnp.float32), inv_freq)
 
 
@@ -506,7 +553,7 @@ class VisionPatchEmbed(nn.Module):
 
     @nn.compact
     def __call__(self, x: jax.Array) -> jax.Array:
-        return nn.Dense(self.embed_dim, use_bias=False, dtype=self.dtype, name="proj")(x.astype(self.dtype))
+        return nn.Dense(self.embed_dim, use_bias=True, dtype=self.dtype, name="proj")(x.astype(self.dtype))
 
 
 class VisionAttention(nn.Module):
@@ -554,15 +601,28 @@ class VisionAttention(nn.Module):
         return nn.Dense(self.hidden_size, use_bias=True, dtype=self.dtype, name="proj")(out)
 
 
+class VisionMLP(nn.Module):
+    hidden_size: int
+    intermediate_size: int
+    dtype: DType = jnp.bfloat16
+
+    @nn.compact
+    def __call__(self, x: jax.Array) -> jax.Array:
+        x = nn.Dense(self.intermediate_size, use_bias=True, dtype=self.dtype, name="linear_fc1")(x)
+        x = jax.nn.gelu(x, approximate=True)
+        x = nn.Dense(self.hidden_size, use_bias=True, dtype=self.dtype, name="linear_fc2")(x)
+        return x
+
+
 class VisionBlock(nn.Module):
     spec: VisionBackboneSpec
     dtype: DType = jnp.bfloat16
 
     def setup(self):
-        self.norm1 = RMSNorm(self.spec.hidden_size, 1e-6, self.dtype)
-        self.norm2 = RMSNorm(self.spec.hidden_size, 1e-6, self.dtype)
+        self.norm1 = LayerNorm(self.spec.hidden_size, 1e-6, self.dtype)
+        self.norm2 = LayerNorm(self.spec.hidden_size, 1e-6, self.dtype)
         self.attn = VisionAttention(self.spec.hidden_size, self.spec.num_heads, self.dtype)
-        self.mlp = FeedForward(self.spec.hidden_size, self.spec.intermediate_size, self.dtype, use_bias=True)
+        self.mlp = VisionMLP(self.spec.hidden_size, self.spec.intermediate_size, self.dtype)
 
     def __call__(self, x: jax.Array, cos: jax.Array, sin: jax.Array, cu_seqlens: jax.Array) -> jax.Array:
         x = x + self.attn(self.norm1(x), cos, sin, cu_seqlens)
@@ -581,9 +641,9 @@ class VisionPatchMerger(nn.Module):
         self.unit = self.spatial_merge_size ** 2
         self.hidden_size = self.context_dim * self.unit
         norm_dim = self.hidden_size if self.use_postshuffle_norm else self.context_dim
-        self.norm = RMSNorm(norm_dim, 1e-6, self.dtype)
-        self.linear1 = nn.Dense(self.hidden_size, use_bias=True, dtype=self.dtype)
-        self.linear2 = nn.Dense(self.out_dim, use_bias=True, dtype=self.dtype)
+        self.norm = LayerNorm(norm_dim, 1e-6, self.dtype)
+        self.linear_fc1 = nn.Dense(self.hidden_size, use_bias=True, dtype=self.dtype, name="linear_fc1")
+        self.linear_fc2 = nn.Dense(self.out_dim, use_bias=True, dtype=self.dtype, name="linear_fc2")
 
     def __call__(self, x: jax.Array) -> jax.Array:
         if self.use_postshuffle_norm:
@@ -592,8 +652,8 @@ class VisionPatchMerger(nn.Module):
         else:
             x = self.norm(x)
             x = x.reshape(-1, self.unit * self.context_dim)
-        x = nn.gelu(self.linear1(x))
-        return self.linear2(x)
+        x = jax.nn.gelu(self.linear_fc1(x))
+        return self.linear_fc2(x)
 
 
 class Qwen3VisionTransformer(nn.Module):
@@ -603,6 +663,12 @@ class Qwen3VisionTransformer(nn.Module):
     def setup(self):
         patch_vol = self.spec.in_channels * self.spec.temporal_patch_size * self.spec.patch_size ** 2
         self.patch_embed = VisionPatchEmbed(self.spec.hidden_size, patch_vol, self.dtype)
+        self.pos_embed = None
+        self.num_grid_per_side = None
+        if self.spec.num_position_embeddings:
+            self.pos_embed = nn.Embed(self.spec.num_position_embeddings, self.spec.hidden_size,
+                                      dtype=self.dtype, name="pos_embed")
+            self.num_grid_per_side = int(self.spec.num_position_embeddings ** 0.5)
         rotary_dim = (self.spec.hidden_size // self.spec.num_heads) // 2
         self.rotary = VisionRotaryEmbedding(rotary_dim)
         self.blocks = [VisionBlock(self.spec, self.dtype) for _ in range(self.spec.depth)]
@@ -630,6 +696,75 @@ class Qwen3VisionTransformer(nn.Module):
         max_grid = int(jnp.max(grid_thw[:, 1:]))
         rotary_full = self.rotary(max_grid)
         return rotary_full[pos_ids].reshape(pos_ids.shape[0], -1)
+
+    def _fast_pos_embed_interpolate(self, grid_thw: jax.Array) -> jax.Array:
+        if self.pos_embed is None or self.num_grid_per_side is None:
+            return jnp.zeros((0, self.spec.hidden_size), dtype=self.dtype)
+
+        grid = np.asarray(grid_thw)
+        grid_ts = grid[:, 0].astype(np.int32)
+        grid_hs = grid[:, 1].astype(np.int32)
+        grid_ws = grid[:, 2].astype(np.int32)
+        num_grid = int(self.num_grid_per_side)
+
+        idx_list = [[] for _ in range(4)]
+        weight_list = [[] for _ in range(4)]
+        for h, w in zip(grid_hs, grid_ws):
+            h_idxs = np.linspace(0, num_grid - 1, int(h), dtype=np.float32)
+            w_idxs = np.linspace(0, num_grid - 1, int(w), dtype=np.float32)
+
+            h_floor = h_idxs.astype(np.int32)
+            w_floor = w_idxs.astype(np.int32)
+            h_ceil = np.clip(h_floor + 1, 0, num_grid - 1)
+            w_ceil = np.clip(w_floor + 1, 0, num_grid - 1)
+
+            dh = h_idxs - h_floor
+            dw = w_idxs - w_floor
+
+            base_h = h_floor * num_grid
+            base_h_ceil = h_ceil * num_grid
+
+            indices = [
+                (base_h[:, None] + w_floor[None]).reshape(-1),
+                (base_h[:, None] + w_ceil[None]).reshape(-1),
+                (base_h_ceil[:, None] + w_floor[None]).reshape(-1),
+                (base_h_ceil[:, None] + w_ceil[None]).reshape(-1),
+            ]
+
+            weights = [
+                ((1.0 - dh)[:, None] * (1.0 - dw)[None]).reshape(-1),
+                ((1.0 - dh)[:, None] * dw[None]).reshape(-1),
+                (dh[:, None] * (1.0 - dw)[None]).reshape(-1),
+                (dh[:, None] * dw[None]).reshape(-1),
+            ]
+
+            for i in range(4):
+                idx_list[i].append(indices[i])
+                weight_list[i].append(weights[i])
+
+        idx_concat = [np.concatenate(vals) if vals else np.array([], dtype=np.int32) for vals in idx_list]
+        weight_concat = [np.concatenate(vals) if vals else np.array([], dtype=np.float32) for vals in weight_list]
+
+        idx_tensor = jnp.asarray(idx_concat, dtype=jnp.int32)
+        weight_tensor = jnp.asarray(weight_concat, dtype=self.dtype)
+
+        pos_embeds = self.pos_embed(idx_tensor) * weight_tensor[..., None]
+        patch_pos_embeds = pos_embeds[0] + pos_embeds[1] + pos_embeds[2] + pos_embeds[3]
+
+        merge = int(self.spec.spatial_merge_size)
+        splits = [int(h * w) for h, w in zip(grid_hs, grid_ws)]
+        out_chunks = []
+        offset = 0
+        for t, h, w, count in zip(grid_ts, grid_hs, grid_ws, splits):
+            pos_embed = patch_pos_embeds[offset:offset + count]
+            offset += count
+            if int(t) > 1:
+                pos_embed = jnp.repeat(pos_embed, int(t), axis=0)
+            pos_embed = pos_embed.reshape(int(t), int(h) // merge, merge, int(w) // merge, merge, -1)
+            pos_embed = pos_embed.transpose(0, 1, 3, 2, 4, 5).reshape(-1, pos_embed.shape[-1])
+            out_chunks.append(pos_embed)
+
+        return jnp.concatenate(out_chunks, axis=0) if out_chunks else jnp.zeros((0, self.spec.hidden_size), dtype=self.dtype)
 
     def _get_window_index(self, grid_thw: jax.Array) -> Tuple[jax.Array, jax.Array]:
         """Compute window-based attention indices"""
@@ -665,27 +800,43 @@ class Qwen3VisionTransformer(nn.Module):
 
     def __call__(self, pixel_values: jax.Array, grid_thw: jax.Array) -> tuple[jax.Array, tuple]:
         x = self.patch_embed(pixel_values)
+        if self.pos_embed is not None:
+            pos_embeds = self._fast_pos_embed_interpolate(grid_thw)
+            if pos_embeds.shape[0] == x.shape[0]:
+                x = x + pos_embeds.astype(x.dtype)
         rotary_emb = self._rot_pos_emb(grid_thw)
-        window_idx, cu_window = self._get_window_index(grid_thw)
+        fullatt_set = set(self.spec.fullatt_block_indexes)
+        use_window = len(fullatt_set) < len(self.blocks)
+        window_idx = None
+        cu_window = None
+        if use_window:
+            window_idx, cu_window = self._get_window_index(grid_thw)
 
         # Shuffle for window attention
-        seq_len, merge_unit = x.shape[0], self.spec.spatial_merge_size ** 2
-        x = x.reshape(seq_len // merge_unit, merge_unit, -1)[window_idx, :, :].reshape(seq_len, -1)
-        rotary_emb = rotary_emb.reshape(seq_len // merge_unit, merge_unit, -1)[window_idx, :, :].reshape(seq_len, -1)
+        if use_window and window_idx is not None:
+            seq_len, merge_unit = x.shape[0], self.spec.spatial_merge_size ** 2
+            x = x.reshape(seq_len // merge_unit, merge_unit, -1)[window_idx, :, :].reshape(seq_len, -1)
+            rotary_emb = rotary_emb.reshape(seq_len // merge_unit, merge_unit, -1)[window_idx, :, :].reshape(seq_len, -1)
 
         # Duplicate for full head_dim
         emb = jnp.concatenate([rotary_emb, rotary_emb], axis=-1)
         cos, sin = jnp.cos(emb).astype(self.dtype), jnp.sin(emb).astype(self.dtype)
 
         # Cumulative sequence lengths for full attention blocks
-        cu_seqlens = jnp.cumsum(jnp.array([int(t * h * w * merge_unit) for t, h, w in grid_thw]))
-        cu_seqlens = jnp.concatenate([jnp.array([0]), cu_seqlens])
+        if use_window:
+            merge_unit = self.spec.spatial_merge_size ** 2
+            cu_seqlens = jnp.cumsum(jnp.array([int(t * h * w * merge_unit) for t, h, w in grid_thw]))
+            cu_seqlens = jnp.concatenate([jnp.array([0]), cu_seqlens])
+        else:
+            frame_sizes = jnp.repeat(grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0])
+            cu_seqlens = jnp.concatenate(
+                [jnp.array([0], dtype=jnp.int32), jnp.cumsum(frame_sizes, dtype=jnp.int32)]
+            )
 
         # Forward through blocks
-        fullatt_set = set(self.spec.fullatt_block_indexes)
         deepstack_feats = []
         for i, block in enumerate(self.blocks):
-            cu = cu_seqlens if i in fullatt_set else cu_window
+            cu = cu_seqlens if (not use_window or i in fullatt_set) else cu_window
             x = block(x, cos, sin, cu)
             if i in self.deepstack_visual_indexes:
                 feat = self.deepstack_mergers[len(deepstack_feats)](x)
@@ -693,9 +844,10 @@ class Qwen3VisionTransformer(nn.Module):
 
         # Merge and unshuffle
         x = self.merger(x)
-        reverse_idx = jnp.argsort(window_idx)
-        x = x[reverse_idx, :]
-        deepstack_feats = [f[reverse_idx, :] for f in deepstack_feats]
+        if use_window and window_idx is not None:
+            reverse_idx = jnp.argsort(window_idx)
+            x = x[reverse_idx, :]
+            deepstack_feats = [f[reverse_idx, :] for f in deepstack_feats]
         return x, tuple(deepstack_feats)
 
 
@@ -800,7 +952,8 @@ class Qwen3VLModel(nn.Module):
         offsets = rope_deltas.astype(jnp.int32)[None, :, :] if rope_deltas is not None else jnp.zeros((axes, batch, 1), dtype=jnp.int32)
         pos_axes = base_pos + offsets
         cos, sin = build_mrope(pos_axes, tuple(self.spec.text.rope_section), self.spec.text.rope_theta,
-                              self.dtype, self.spec.text.rope_scaling_type, self.spec.text.rope_scaling_factor)
+                              self.dtype, self.spec.text.rope_scaling_type, self.spec.text.rope_scaling_factor,
+                              self.spec.text.mrope_interleaved)
         mask = mask if mask is not None else jnp.ones((token.shape[0], 1), dtype=jnp.int32)
         logits, new_cache = self.forward_text(token[:, None], cos, sin, mask, cache)
         return logits[:, -1, :], new_cache
@@ -876,6 +1029,9 @@ def spec_from_config(cfg: dict) -> Qwen3VLSpec:
         patch_sz = vision_cfg.get("patch_size", vision_cfg.get("spatial_patch_size"))
         temp_patch = vision_cfg.get("temporal_patch_size", vision_cfg.get("temporal_patch", 1))
         window_sz = vision_cfg.get("window_size", patch_sz * vision_cfg.get("spatial_merge_size", 1))
+        fullatt_blocks = vision_cfg.get("fullatt_block_indexes", vision_cfg.get("deepstack_visual_indexes", []))
+        if vision_cfg.get("model_type") == "qwen3_vl":
+            fullatt_blocks = list(range(vision_cfg["depth"]))
         vision = VisionBackboneSpec(
             hidden_size=vision_cfg["hidden_size"],
             out_hidden_size=vision_cfg["out_hidden_size"],
@@ -887,7 +1043,7 @@ def spec_from_config(cfg: dict) -> Qwen3VLSpec:
             spatial_merge_size=vision_cfg["spatial_merge_size"],
             window_size=window_sz,
             in_channels=vision_cfg.get("in_channels", vision_cfg.get("in_chans", 3)),
-            fullatt_block_indexes=vision_cfg.get("fullatt_block_indexes", vision_cfg.get("deepstack_visual_indexes", [])),
+            fullatt_block_indexes=fullatt_blocks,
             num_position_embeddings=vision_cfg.get("num_position_embeddings"),
             deepstack_visual_indexes=tuple(vision_cfg.get("deepstack_visual_indexes", [])),
         )
@@ -899,7 +1055,8 @@ def spec_from_config(cfg: dict) -> Qwen3VLSpec:
 # Regex rules: HF torch param names -> Flax tree paths
 _TEXT_KEY_RULES = {
     r"model\.language_model\.(model\.)?embed_tokens\.weight": "embed/embedding",
-    r"model\.language_model\.(model\.)?layers\.(\d+)\.self_attn\.(q|k|v)_proj\.(weight|bias)": r"layers_\2/attn/\3_proj/\4",
+    r"model\.language_model\.(model\.)?layers\.(\d+)\.self_attn\.(q|k|v)_proj\.weight": r"layers_\2/attn/\3_proj/kernel",
+    r"model\.language_model\.(model\.)?layers\.(\d+)\.self_attn\.(q|k|v)_proj\.bias": r"layers_\2/attn/\3_proj/bias",
     r"model\.language_model\.(model\.)?layers\.(\d+)\.self_attn\.(q|k)_norm\.weight": r"layers_\2/attn/\3_norm/weight",
     r"model\.language_model\.(model\.)?layers\.(\d+)\.self_attn\.o_proj\.weight": r"layers_\2/attn/o_proj/kernel",
     r"model\.language_model\.(model\.)?layers\.(\d+)\.mlp\.(gate|up|down)_proj\.weight": r"layers_\2/mlp/\3_proj/kernel",
@@ -911,13 +1068,22 @@ _TEXT_KEY_RULES = {
 }
 
 _VISION_KEY_RULES = {
-    r"(model\.)?visual\.blocks\.(\d+)\.(norm1|norm2)\.weight": r"visual/blocks_\2/\3/weight",
-    r"(model\.)?visual\.blocks\.(\d+)\.attn\.(qkv|proj)\.(weight|bias)": r"visual/blocks_\2/attn/\3/\4",
-    r"(model\.)?visual\.blocks\.(\d+)\.mlp\.(gate|up|down)_proj\.(weight|bias)": r"visual/blocks_\2/mlp/\3_proj/\4",
-    r"(model\.)?visual\.merger\.ln_q\.weight": "visual/merger/norm/weight",
-    r"(model\.)?visual\.merger\.mlp\.(0|2)\.(weight|bias)": r"visual/merger/linear\1/\2",
-    r"(model\.)?visual\.deepstack_merger_list\.(\d+)\.norm\.weight": r"visual/deepstack_mergers_\2/norm/weight",
-    r"(model\.)?visual\.deepstack_merger_list\.(\d+)\.linear_fc(1|2)\.(weight|bias)": r"visual/deepstack_mergers_\2/linear\3/\4",
+    r"(model\.)?visual\.blocks\.(\d+)\.(norm1|norm2)\.(weight|bias)": r"visual/blocks_\2/\3/\4",
+    r"(model\.)?visual\.blocks\.(\d+)\.attn\.(qkv|proj)\.weight": r"visual/blocks_\2/attn/\3/kernel",
+    r"(model\.)?visual\.blocks\.(\d+)\.attn\.(qkv|proj)\.bias": r"visual/blocks_\2/attn/\3/bias",
+    r"(model\.)?visual\.blocks\.(\d+)\.mlp\.linear_fc1\.(weight|bias)": r"visual/blocks_\2/mlp/linear_fc1/\3",
+    r"(model\.)?visual\.blocks\.(\d+)\.mlp\.linear_fc2\.(weight|bias)": r"visual/blocks_\2/mlp/linear_fc2/\3",
+    r"(model\.)?visual\.blocks\.(\d+)\.mlp\.(gate|up|down)_proj\.weight": r"visual/blocks_\2/mlp/\3_proj/kernel",
+    r"(model\.)?visual\.blocks\.(\d+)\.mlp\.(gate|up|down)_proj\.bias": r"visual/blocks_\2/mlp/\3_proj/bias",
+    r"(model\.)?visual\.patch_embed\.proj\.weight": "visual/patch_embed/proj/kernel",
+    r"(model\.)?visual\.patch_embed\.proj\.bias": "visual/patch_embed/proj/bias",
+    r"(model\.)?visual\.pos_embed\.weight": "visual/pos_embed/embedding",
+    r"(model\.)?visual\.merger\.norm\.(weight|bias)": r"visual/merger/norm/\2",
+    r"(model\.)?visual\.merger\.linear_fc1\.(weight|bias)": r"visual/merger/linear_fc1/\2",
+    r"(model\.)?visual\.merger\.linear_fc2\.(weight|bias)": r"visual/merger/linear_fc2/\2",
+    r"(model\.)?visual\.deepstack_merger_list\.(\d+)\.norm\.(weight|bias)": r"visual/deepstack_mergers_\2/norm/\3",
+    r"(model\.)?visual\.deepstack_merger_list\.(\d+)\.linear_fc1\.(weight|bias)": r"visual/deepstack_mergers_\2/linear_fc1/\3",
+    r"(model\.)?visual\.deepstack_merger_list\.(\d+)\.linear_fc2\.(weight|bias)": r"visual/deepstack_mergers_\2/linear_fc2/\3",
 }
 
 
@@ -927,9 +1093,11 @@ def _torch_key_to_flax(key: str) -> Optional[str]:
         for pattern, target in rules.items():
             if re.match(pattern, key):
                 flax_key = re.sub(pattern, target, key)
-                # Fix kernel vs weight/bias naming
-                if "weight" in key and "kernel" not in flax_key:
-                    flax_key = flax_key.replace("weight", "kernel")
+                # Fix kernel vs weight naming for non-norm, non-embed params.
+                if flax_key.endswith("/weight"):
+                    parts = flax_key.split("/")
+                    if not any("norm" in part for part in parts) and not any("embed" in part for part in parts):
+                        flax_key = flax_key[:-len("/weight")] + "/kernel"
                 return flax_key
     return None
 

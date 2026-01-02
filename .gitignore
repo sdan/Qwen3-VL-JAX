@@ -50,3 +50,4 @@ venv/
 # Test outputs
 test_outputs/
 outputs/
+Qwen3-VL/
