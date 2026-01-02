@@ -7,19 +7,38 @@ __pycache__/
 *.egg-info/
 dist/
 build/
+eggs/
+*.egg
+.eggs/
+*.manifest
+*.spec
 
-# JAX/Flax
+# JAX/Flax/MLX
 *.pkl
 *.msgpack
+*.npz
+*.npy
 
 # Checkpoints and model files
 checkpoints/
 *.safetensors
+*.bin
+*.pt
+*.pth
+*.ckpt
 params.pkl
+*.gguf
+
+# HuggingFace
+.huggingface/
+~/.cache/huggingface/
 
 # Logs
 *.log
 logs/
+wandb/
+runs/
+tensorboard/
 
 # IDE
 .vscode/
@@ -28,6 +47,7 @@ logs/
 *.swo
 *~
 .DS_Store
+Thumbs.db
 
 # Jupyter
 .ipynb_checkpoints/
@@ -37,12 +57,17 @@ logs/
 .uv_cache/
 .cache/
 __pypackages__/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 
 # Environment
 .env
+.env.*
 .venv/
 env/
 venv/
+ENV/
 
 # Claude Code
 .claude/
@@ -51,3 +76,9 @@ venv/
 test_outputs/
 outputs/
 Qwen3-VL/
+results/
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
