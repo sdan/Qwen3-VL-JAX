@@ -82,3 +82,6 @@ results/
 *.tmp
 *.temp
 *.bak
+
+# Triton kernels (GPU-specific, not needed for JAX/MLX)
+triton_kernels/
