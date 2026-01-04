@@ -1,7 +1,4 @@
-"""Sampling, image preprocessing, and inference for Qwen3-VL
-
-All inference logic in one file: image prep, tokenization, sampling, VLM inputs.
-No KV cache - each decode step recomputes attention over the full sequence.
+"""Sampling, image preprocessing, and inference for Qwen3-VL JAX, image and other process impl are from the official Qwen3VL cookbook
 """
 from __future__ import annotations
 
