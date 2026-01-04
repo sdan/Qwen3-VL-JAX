@@ -1,8 +1,4 @@
-"""Qwen3‑VL JAX model — all architecture in one file.
-
-Small, readable, minimal abstraction. This file defines the full text
-decoder and vision encoder with just enough structure to stay clear.
-Shapes are kept explicit in docstrings where it matters.
+"""Qwen3‑VL main
 
 Reference upstream config mapping for weights:
 https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen2_5_vl/modular_qwen2_5_vl.py
