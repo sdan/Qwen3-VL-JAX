@@ -3,23 +3,17 @@
 
 A minimal, readable implementation of Qwen3‑VL inference in JAX/Flax(no PyTorch or HuggingFace(except tokenizers)!)
 
-- `model.py` — Text decoder, vision encoder, mRoPE, GQA, loaders - all in 718 loc
+- `model.py` — Text decoder, vision encoder, mRoPE, GQA, loaders
 - `sample.py` — Image preprocessing, prompting helpers, top‑k/top‑p sampling
 - `utils.py` — Config (chz), logging, checkpoints, HF→JAX conversion
 - `run.py` — Minimal CLI example
-
-#### Some performance stats on my M1 Max Macbook:
-- Prefill ~150 ms (512 text + 1k vision)
-- Decode ~30 ms/token (~33 tok/s)
-- ~6 GB total memory (weights+cache+acts)
 
 ## Qwen3-VL-2B Card (default):
 
 - Decoder: Transformer with GQA; depth/width taken from HF config
 - Vision: ViT with window attention and 2×2 spatial merge
 - Positional encoding: 1D RoPE for text, 3D mRoPE for vision (t/h/w)
-- Additional: QK‑norm, grouped‑query attention (smaller KV cache)
-- Includes KV cache for fast autoregressive decoding
+- Additional: QK‑norm, grouped‑query attention
   
 ## Quickstart
 
@@ -88,4 +82,4 @@ print(result.texts[0])
 I saw ThinkingMachines use chz so I decided to make it first-class. This also allows you to easily swap config right in the CLI as such:
 `uv run python run.py --image img.jpg sampling.temperature=0.95 sampling.max_new_tokens=512 model.dtype=float32`
 
-Most of this code was taken from (sdan/vlm-gym)[https://github.com/sdan/vlm-gym] as an attempt to cleanly abstract it out to sample from the policy optimization loop. As mentioned previously the impetus was mainly I couldnt find a KV Cache impl of the Qwen vision models so I wrote this, your main contribution would ideally be on speed-up optimizations; thanks!
+Most of this code was taken from [sdan/vlm-gym](https://github.com/sdan/vlm-gym) as an attempt to cleanly abstract it out to sample from the policy optimization loop.

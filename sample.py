@@ -1,6 +1,7 @@
 """Sampling, image preprocessing, and inference for Qwen3-VL
 
 All inference logic in one file: image prep, tokenization, sampling, VLM inputs.
+No KV cache - each decode step recomputes attention over the full sequence.
 """
 from __future__ import annotations
 
@@ -12,7 +13,7 @@ import jax, jax.numpy as jnp
 import numpy as np
 
 # Import from consolidated model
-from model import KVCache, VisionEmbeddings, build_mrope, build_text_rope
+from model import VisionEmbeddings, build_mrope, build_text_rope
 
 # ============================================================================
 # Image preprocessing
@@ -263,9 +264,6 @@ class _RopeSpec:
     rope_scaling_type: Optional[str]
     rope_scaling_factor: Optional[float]
     dtype: jnp.dtype
-    num_layers: int
-    num_kv_heads: int
-    head_dim: int
     mrope_interleaved: bool
 
 
@@ -278,48 +276,85 @@ def _rope_spec_from_model(model) -> _RopeSpec:
         rope_scaling_type=getattr(text_spec, "rope_scaling_type", None),
         rope_scaling_factor=getattr(text_spec, "rope_scaling_factor", None),
         dtype=model.dtype,
-        num_layers=int(text_spec.num_hidden_layers),
-        num_kv_heads=int(text_spec.num_key_value_heads),
-        head_dim=int(text_spec.head_dim),
         mrope_interleaved=bool(getattr(text_spec, "mrope_interleaved", False)),
     )
 
 
-def _init_cache(spec: _RopeSpec, batch: int, max_len: int) -> KVCache:
-    """Initialize empty KV cache"""
-    return KVCache.init(batch, spec.num_layers, spec.num_kv_heads, spec.head_dim, max_len, spec.dtype)
+_FORWARD_CACHE: dict[tuple[int, int, tuple], tuple] = {}
 
 
-def _prefill_text(model, params, tokens: jnp.ndarray, pad_id: int, spec: _RopeSpec,
-                 max_cache_len: Optional[int]) -> Tuple[KVCache, jnp.ndarray]:
-    """Prefill cache for text-only inputs"""
-    if tokens.ndim != 2:
-        raise ValueError("tokens must be [batch, seq]")
+def _spec_cache_key(spec: _RopeSpec) -> tuple:
+    dtype_name = spec.dtype.name if hasattr(spec.dtype, "name") else str(spec.dtype)
+    return (
+        spec.rope_section,
+        spec.rope_theta,
+        spec.rope_scaling_type,
+        spec.rope_scaling_factor,
+        dtype_name,
+        spec.mrope_interleaved,
+    )
 
+
+def _get_forward_fns(model, spec: _RopeSpec, pad_id: int):
+    key = (id(model), pad_id, _spec_cache_key(spec))
+    cached = _FORWARD_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    def _forward_text_jit(params, tokens):
+        return _forward_text(model, params, tokens, pad_id, spec)
+
+    def _forward_vlm_jit(params, tokens, vision, pos3, image_pad_id, seq_len):
+        return _forward_vlm_inner(model, params, tokens, vision, pos3, image_pad_id, pad_id, spec, seq_len)
+
+    fns = (jax.jit(_forward_text_jit), jax.jit(_forward_vlm_jit))
+    _FORWARD_CACHE[key] = fns
+    return fns
+
+
+def _forward_text(model, params, tokens: jnp.ndarray, pad_id: int, spec: _RopeSpec) -> jnp.ndarray:
+    """Forward pass for text-only inputs, returns logits"""
     positions, mask = token_positions(tokens, pad_id)
     cos, sin = build_text_rope(positions, spec.rope_section, spec.rope_theta, spec.dtype,
                                rope_scaling_type=spec.rope_scaling_type,
                                rope_scaling_factor=spec.rope_scaling_factor,
                                mrope_interleaved=spec.mrope_interleaved)
-    cache = _init_cache(spec, tokens.shape[0], int(max_cache_len or tokens.shape[1]))
-
-    def _prefill(params, tokens, cos, sin, mask, cache):
-        _, cache_out = model.apply({"params": params}, tokens, cos, sin, mask=mask, cache=cache,
-                                  method=model.forward_text)
-        return cache_out
-    _prefill = jax.jit(_prefill, donate_argnames=['cache'])
-
-    cache_out = _prefill(params, tokens, cos, sin, mask, cache)
-    rope_deltas = jnp.zeros((tokens.shape[0], 1), dtype=jnp.int32)
-    return cache_out, rope_deltas
+    return model.apply({"params": params}, tokens, cos, sin, mask=mask, method=model.forward_text)
 
 
-def _prefill_vlm(model, params, tokens: jnp.ndarray, vision: Union[VisionEmbeddings, jnp.ndarray],
-                grid_thw: jnp.ndarray, image_pad_id: int, vision_start_id: int, pad_id: int, spec: _RopeSpec,
-                max_cache_len: Optional[int]) -> Tuple[jnp.ndarray, KVCache, jnp.ndarray]:
-    """Prefill cache for vision-language inputs"""
-    if tokens.ndim != 2:
-        raise ValueError("tokens must be [batch, seq]")
+def _forward_vlm_inner(model, params, tokens: jnp.ndarray, vision: Union[VisionEmbeddings, jnp.ndarray],
+                       pos3: jnp.ndarray, image_pad_id: int, pad_id: int,
+                       spec: _RopeSpec, seq_len: jnp.ndarray) -> jnp.ndarray:
+    """JIT-compilable forward pass for VLM (rope positions pre-computed).
+
+    Uses seq_len to mask attention - shapes stay fixed for JIT cache reuse.
+    """
+    # Create causal mask that only attends up to seq_len
+    # tokens shape: [B, T], we want to mask positions >= seq_len
+    B, T = tokens.shape
+    positions = jnp.arange(T)[None, :]  # [1, T]
+    valid_mask = (positions < seq_len[:, None]).astype(jnp.int32)  # [B, T]
+
+    cos, sin = build_mrope(pos3, spec.rope_section, spec.rope_theta, spec.dtype,
+                          rope_scaling_type=spec.rope_scaling_type,
+                          rope_scaling_factor=spec.rope_scaling_factor,
+                          mrope_interleaved=spec.mrope_interleaved)
+
+    # Cast vision features
+    if isinstance(vision, VisionEmbeddings):
+        vision_pack = vision.cast(spec.dtype)
+    else:
+        vision_arr = jnp.asarray(vision, dtype=spec.dtype)
+        vision_pack = VisionEmbeddings(tokens=vision_arr, deepstack=())
+
+    return model.apply({"params": params}, tokens, vision_pack, image_pad_id,
+                      cos, sin, mask=valid_mask, method=model.forward_vlm)
+
+
+def _compute_rope_positions(model, tokens: jnp.ndarray, grid_thw: jnp.ndarray,
+                            image_pad_id: int, vision_start_id: int, pad_id: int) -> jnp.ndarray:
+    """Compute mRoPE positions for VLM (runs outside JIT - uses data-dependent indexing)."""
+    from model import get_rope_index
 
     mask = (tokens != pad_id).astype(jnp.int32)
     batch = int(tokens.shape[0])
@@ -334,9 +369,7 @@ def _prefill_vlm(model, params, tokens: jnp.ndarray, vision: Union[VisionEmbeddi
     elif grid_thw.ndim == 3 and grid_thw.shape[0] == 1 and batch > 1:
         grid_thw = jnp.tile(grid_thw, (batch, 1, 1))
 
-    # Get mRoPE indices for Qwen3-VL
-    from model import get_rope_index
-    pos3, deltas = get_rope_index(
+    pos3, _ = get_rope_index(
         spatial_merge_size=model.spec.vision.spatial_merge_size,
         input_ids=tokens,
         image_grid_thw=grid_thw,
@@ -344,122 +377,109 @@ def _prefill_vlm(model, params, tokens: jnp.ndarray, vision: Union[VisionEmbeddi
         image_token_id=int(image_pad_id) if image_pad_id is not None else None,
         vision_start_id=int(vision_start_id) if vision_start_id is not None else None,
     )
-
-    cos, sin = build_mrope(pos3, spec.rope_section, spec.rope_theta, spec.dtype,
-                          rope_scaling_type=spec.rope_scaling_type,
-                          rope_scaling_factor=spec.rope_scaling_factor,
-                          mrope_interleaved=spec.mrope_interleaved)
-
-    max_len = int(max_cache_len or tokens.shape[1])
-    cache = _init_cache(spec, batch, max_len)
-
-    # Cast vision features
-    if isinstance(vision, VisionEmbeddings):
-        vision_pack = vision.cast(spec.dtype)
-    else:
-        vision_arr = jnp.asarray(vision, dtype=spec.dtype)
-        vision_pack = VisionEmbeddings(tokens=vision_arr, deepstack=())
-
-    def _prefill(params, tokens, vision_pack, image_pad_id, cos, sin, mask, cache):
-        logits, cache_out = model.apply({"params": params}, tokens, vision_pack, image_pad_id,
-                                        cos, sin, mask=mask, cache=cache, method=model.forward_vlm)
-        return logits, cache_out
-    _prefill = jax.jit(_prefill, donate_argnames=['cache'])
-
-    logits, cache = _prefill(params, tokens, vision_pack, image_pad_id, cos, sin, mask, cache)
-    return logits, cache, deltas.astype(jnp.int32)
-
-
-def _decode_loop(model, params, cache: KVCache, first_token: jnp.ndarray, steps: int,
-                temperature: float, top_p: Optional[float], eos_id: Optional[int], top_k: Optional[int],
-                rope_deltas: Optional[jnp.ndarray], rng: jax.Array, return_logprobs: bool
-                ) -> Tuple[jnp.ndarray, Optional[jnp.ndarray]]:
-    """Autoregressive decode loop"""
-    if steps <= 0:
-        empty = jnp.zeros((first_token.shape[0], 0), dtype=jnp.int32)
-        return (empty, empty.astype(jnp.float32)) if return_logprobs else (empty, None)
-    if temperature <= 0:
-        raise ValueError("temperature must be positive")
-
-    temp = jnp.float32(temperature)
-    eos_scalar = jnp.int32(eos_id if eos_id is not None else -1)
-    has_eos = eos_scalar >= 0
-    use_top_k = int(top_k) if top_k is not None else 0
-    topp_val = float(top_p) if (top_p and 0.0 < float(top_p) < 1.0) else None
-
-    def _scan_decode(params, offsets, cache_init, first_tok, rng_init):
-        def _one_step(params, offsets, carry, _):
-            cache_state, current_tok, rng_state, stopped = carry
-            rng_state, step_key = jax.random.split(rng_state)
-            step_mask = (jnp.logical_not(stopped)).astype(jnp.int32)[:, None]
-
-            logits, cache_state = model.apply({"params": params}, current_tok, cache_state,
-                                              offsets, step_mask, method=model.decode_step)
-            logits = logits.astype(jnp.float32) / temp
-            masked = mask_logits_topk_topp(logits, top_k=use_top_k, top_p=topp_val)
-            next_token = jax.random.categorical(step_key, masked)
-
-            if return_logprobs:
-                log_probs = jax.nn.log_softmax(masked)
-                gathered = log_probs[jnp.arange(log_probs.shape[0]), next_token]
-            else:
-                gathered = jnp.zeros((masked.shape[0],), dtype=jnp.float32)
-
-            hit_eos = jnp.logical_and(has_eos, next_token == eos_scalar)
-            stopped_new = jnp.logical_or(stopped, hit_eos)
-            effective_next = jnp.where(jnp.logical_and(stopped, has_eos),
-                                      jnp.broadcast_to(eos_scalar, next_token.shape), next_token)
-
-            carry_out = (cache_state, effective_next.astype(jnp.int32), rng_state, stopped_new)
-            y = (effective_next.astype(jnp.int32), gathered.astype(jnp.float32))
-            return carry_out, y
-
-        init_carry = (cache_init, first_tok.astype(jnp.int32), rng_init,
-                     jnp.zeros_like(first_tok, dtype=jnp.bool_))
-        carry_out, ys = jax.lax.scan(lambda c, _: _one_step(params, offsets, c, _),
-                                     init_carry, xs=None, length=int(steps))
-        tokens_seq, logprobs_seq = ys
-        return tokens_seq.transpose(1, 0), logprobs_seq.transpose(1, 0)
-    _scan_decode = jax.jit(_scan_decode, donate_argnames=['cache_init'])
-
-    offsets = jnp.asarray(rope_deltas if rope_deltas is not None
-                         else jnp.zeros((cache.lengths.shape[0], 1), dtype=jnp.int32))
-    return _scan_decode(params, offsets, cache, first_token, rng)
+    return pos3
 
 
 def sample(model, params, inputs: Union[VLMInputs, jnp.ndarray, np.ndarray],
           cfg: SamplingConfig, rng: jax.Array, tokenizer=None, return_logprobs: bool = False
           ) -> SampleResult:
-    """Main sampling entry point
+    """Main sampling entry point (no KV cache - recomputes full sequence each step)
 
     Accepts either:
     - VLMInputs for vision-language sampling
     - jnp.ndarray/np.ndarray [B, T] for text-only sampling
 
     Returns SampleResult with generated tokens, optional logprobs, and decoded texts.
+
+    Uses fixed-size padded buffers and full-length forward passes to keep JIT shapes stable.
     """
     spec = _rope_spec_from_model(model)
+    is_vlm = isinstance(inputs, VLMInputs)
 
-    # Determine input type and prefill
-    if isinstance(inputs, VLMInputs):
-        tokens = jnp.asarray(inputs.prompt_tokens, dtype=jnp.int32)
-        _, cache, rope_deltas = _prefill_vlm(model, params, tokens, inputs.vision, inputs.grid_thw,
-                                             inputs.image_pad_id, inputs.vision_start_id, cfg.pad_id, spec,
-                                             max_cache_len=int(tokens.shape[1] + cfg.max_new_tokens))
+    if is_vlm:
+        prompt_tokens = jnp.asarray(inputs.prompt_tokens, dtype=jnp.int32)
     else:
-        tokens = jnp.asarray(inputs, dtype=jnp.int32)
-        cache, rope_deltas = _prefill_text(model, params, tokens, cfg.pad_id, spec,
-                                          max_cache_len=int(tokens.shape[1] + cfg.max_new_tokens))
+        prompt_tokens = jnp.asarray(inputs, dtype=jnp.int32)
 
-    # Get last non-pad token
-    lengths = cache.lengths.astype(jnp.int32)
-    last_idx = jnp.maximum(lengths - 1, 0)
-    last_token = jnp.take_along_axis(tokens, last_idx[:, None], axis=1).squeeze(1)
+    if prompt_tokens.ndim != 2:
+        raise ValueError("tokens must be [batch, seq]")
 
-    # Decode loop
-    new_tokens, new_logprobs = _decode_loop(model, params, cache, last_token, int(cfg.max_new_tokens),
-                                           float(cfg.temperature), cfg.top_p, cfg.eos_id, cfg.top_k,
-                                           rope_deltas, rng, return_logprobs)
+    batch = prompt_tokens.shape[0]
+    prompt_len = prompt_tokens.shape[1]
+    max_new = int(cfg.max_new_tokens)
+    total_len = prompt_len + max_new
+
+    temp = jnp.float32(cfg.temperature)
+    eos_scalar = jnp.int32(cfg.eos_id if cfg.eos_id is not None else -1)
+    has_eos = eos_scalar >= 0
+    use_top_k = int(cfg.top_k) if cfg.top_k is not None else 0
+    topp_val = float(cfg.top_p) if (cfg.top_p and 0.0 < float(cfg.top_p) < 1.0) else None
+    pad_id = int(cfg.pad_id)
+
+    # Pre-allocate fixed-size buffers (avoids recompilation per token)
+    tokens_buf = jnp.full((batch, total_len), pad_id, dtype=jnp.int32)
+    tokens_buf = tokens_buf.at[:, :prompt_len].set(prompt_tokens)
+
+    # Pre-compute rope positions for full sequence length
+    if is_vlm:
+        # Compute positions for prompt
+        pos3_prompt = _compute_rope_positions(model, prompt_tokens, inputs.grid_thw,
+                                              inputs.image_pad_id, inputs.vision_start_id, cfg.pad_id)
+        # Extend positions for max generation length (text positions are sequential)
+        max_pos = int(pos3_prompt.max()) + 1
+        gen_positions = jnp.arange(max_new) + max_pos
+        gen_pos3 = jnp.tile(gen_positions[None, None, :], (3, batch, 1))
+        pos3 = jnp.concatenate([pos3_prompt, gen_pos3], axis=2)
+
+    # JIT-compile forward passes once per model/spec/pad_id
+    _forward_text_jit, _forward_vlm_jit = _get_forward_fns(model, spec, pad_id)
+
+    generated = []
+    logprobs_list = []
+    stopped = jnp.zeros((batch,), dtype=jnp.bool_)
+    cur_len = prompt_len
+
+    for step in range(max_new):
+        rng, step_key = jax.random.split(rng)
+
+        # Forward pass with full-length buffers (stable JIT shape)
+        # seq_len array tells the model which positions are valid
+        seq_len_arr = jnp.full((batch,), cur_len, dtype=jnp.int32)
+        if is_vlm:
+            logits = _forward_vlm_jit(params, tokens_buf, inputs.vision, pos3, inputs.image_pad_id, seq_len_arr)
+        else:
+            logits = _forward_text_jit(params, tokens_buf)
+
+        # Get logits for last generated position
+        last_logits = logits[:, cur_len - 1, :].astype(jnp.float32) / temp
+        masked = mask_logits_topk_topp(last_logits, top_k=use_top_k, top_p=topp_val)
+        next_token = jax.random.categorical(step_key, masked)
+
+        if return_logprobs:
+            log_probs = jax.nn.log_softmax(masked)
+            gathered = log_probs[jnp.arange(batch), next_token]
+            logprobs_list.append(gathered)
+
+        # Check EOS
+        hit_eos = jnp.logical_and(has_eos, next_token == eos_scalar)
+        stopped = jnp.logical_or(stopped, hit_eos)
+
+        # Replace stopped tokens with EOS
+        effective_next = jnp.where(jnp.logical_and(stopped, has_eos),
+                                  jnp.broadcast_to(eos_scalar, next_token.shape), next_token)
+        generated.append(effective_next)
+
+        # Early exit if all stopped
+        if jnp.all(stopped):
+            break
+
+        # Write token to buffer at current position
+        tokens_buf = tokens_buf.at[:, cur_len].set(effective_next)
+        cur_len += 1
+
+    # Stack results
+    new_tokens = jnp.stack(generated, axis=1) if generated else jnp.zeros((batch, 0), dtype=jnp.int32)
+    new_logprobs = jnp.stack(logprobs_list, axis=1) if logprobs_list else None
 
     # Decode texts
     texts = []
@@ -468,14 +488,14 @@ def sample(model, params, inputs: Union[VLMInputs, jnp.ndarray, np.ndarray],
             for row in np.asarray(new_tokens):
                 texts.append(tokenizer.decode(row.tolist(), skip_special_tokens=True))
         except Exception:
-            texts = [""] * int(new_tokens.shape[0])
+            texts = [""] * batch
 
     return SampleResult(tokens=new_tokens, logprobs=new_logprobs, texts=texts)
 
 
 def sample_streaming(model, params, inputs: Union[VLMInputs, jnp.ndarray, np.ndarray],
                     cfg: SamplingConfig, rng: jax.Array, tokenizer=None, return_logprobs: bool = False):
-    """Streaming sampling that yields tokens one at a time
+    """Streaming sampling that yields tokens one at a time (no KV cache)
 
     Accepts either:
     - VLMInputs for vision-language sampling
@@ -483,68 +503,76 @@ def sample_streaming(model, params, inputs: Union[VLMInputs, jnp.ndarray, np.nda
 
     Yields tuples of (token, text, logprob) for each generated token.
     Note: Only supports batch_size=1 for streaming.
+
+    Uses fixed-size padded buffers for stable JIT shapes.
     """
     spec = _rope_spec_from_model(model)
+    is_vlm = isinstance(inputs, VLMInputs)
 
-    # Determine input type and prefill
-    if isinstance(inputs, VLMInputs):
-        tokens = jnp.asarray(inputs.prompt_tokens, dtype=jnp.int32)
-        if tokens.shape[0] != 1:
-            raise ValueError("Streaming only supports batch_size=1")
-        _, cache, rope_deltas = _prefill_vlm(model, params, tokens, inputs.vision, inputs.grid_thw,
-                                             inputs.image_pad_id, inputs.vision_start_id, cfg.pad_id, spec,
-                                             max_cache_len=int(tokens.shape[1] + cfg.max_new_tokens))
+    if is_vlm:
+        prompt_tokens = jnp.asarray(inputs.prompt_tokens, dtype=jnp.int32)
     else:
-        tokens = jnp.asarray(inputs, dtype=jnp.int32)
-        if tokens.shape[0] != 1:
-            raise ValueError("Streaming only supports batch_size=1")
-        cache, rope_deltas = _prefill_text(model, params, tokens, cfg.pad_id, spec,
-                                          max_cache_len=int(tokens.shape[1] + cfg.max_new_tokens))
+        prompt_tokens = jnp.asarray(inputs, dtype=jnp.int32)
 
-    # Get last non-pad token
-    lengths = cache.lengths.astype(jnp.int32)
-    last_idx = jnp.maximum(lengths - 1, 0)
-    current_token = jnp.take_along_axis(tokens, last_idx[:, None], axis=1).squeeze(1)
+    if prompt_tokens.shape[0] != 1:
+        raise ValueError("Streaming only supports batch_size=1")
 
-    # Setup parameters
+    prompt_len = prompt_tokens.shape[1]
+    max_new = int(cfg.max_new_tokens)
+    total_len = prompt_len + max_new
+    pad_id = int(cfg.pad_id)
+
     temp = jnp.float32(cfg.temperature)
     eos_scalar = jnp.int32(cfg.eos_id if cfg.eos_id is not None else -1)
     has_eos = eos_scalar >= 0
     use_top_k = int(cfg.top_k) if cfg.top_k is not None else 0
     topp_val = float(cfg.top_p) if (cfg.top_p and 0.0 < float(cfg.top_p) < 1.0) else None
-    offsets = jnp.asarray(rope_deltas if rope_deltas is not None
-                         else jnp.zeros((1, 1), dtype=jnp.int32))
 
-    # JIT-compile single decode step for performance
-    def _single_step(params, token, cache_state, offsets, rng_key):
-        step_mask = jnp.ones((1, 1), dtype=jnp.int32)
-        logits, cache_new = model.apply({"params": params}, token, cache_state,
-                                        offsets, step_mask, method=model.decode_step)
-        logits = logits.astype(jnp.float32) / temp
-        masked = mask_logits_topk_topp(logits, top_k=use_top_k, top_p=topp_val)
-        next_token = jax.random.categorical(rng_key, masked)
+    # Pre-allocate fixed-size buffer
+    tokens_buf = jnp.full((1, total_len), pad_id, dtype=jnp.int32)
+    tokens_buf = tokens_buf.at[:, :prompt_len].set(prompt_tokens)
 
-        if return_logprobs:
-            log_probs = jax.nn.log_softmax(masked)
-            logprob = log_probs[0, next_token[0]]
-        else:
-            logprob = jnp.float32(0.0)
+    # Pre-compute rope positions for full sequence
+    if is_vlm:
+        pos3_prompt = _compute_rope_positions(model, prompt_tokens, inputs.grid_thw,
+                                              inputs.image_pad_id, inputs.vision_start_id, cfg.pad_id)
+        max_pos = int(pos3_prompt.max()) + 1
+        gen_positions = jnp.arange(max_new) + max_pos
+        gen_pos3 = jnp.tile(gen_positions[None, None, :], (3, 1, 1))
+        pos3 = jnp.concatenate([pos3_prompt, gen_pos3], axis=2)
 
-        return next_token[0], logprob, cache_new
-    _single_step = jax.jit(_single_step, donate_argnames=['cache_state'])
+    # JIT-compile forward passes once per model/spec/pad_id
+    _forward_text_jit, _forward_vlm_jit = _get_forward_fns(model, spec, pad_id)
 
     # Stream tokens one by one
     stopped = False
-    for step in range(int(cfg.max_new_tokens)):
+    cur_len = prompt_len
+    for step in range(max_new):
         if stopped:
             break
 
         rng, step_key = jax.random.split(rng)
-        next_token, logprob, cache = _single_step(params, current_token, cache, offsets, step_key)
+
+        # Forward pass with fixed-size buffer
+        seq_len_arr = jnp.array([cur_len], dtype=jnp.int32)
+        if is_vlm:
+            logits = _forward_vlm_jit(params, tokens_buf, inputs.vision, pos3, inputs.image_pad_id, seq_len_arr)
+        else:
+            logits = _forward_text_jit(params, tokens_buf)
+
+        # Get logits for last valid position
+        last_logits = logits[0, cur_len - 1, :].astype(jnp.float32) / temp
+        masked = mask_logits_topk_topp(last_logits[None, :], top_k=use_top_k, top_p=topp_val)[0]
+        next_token = jax.random.categorical(step_key, masked)
 
         # Convert to Python int
         token_id = int(next_token)
-        logprob_val = float(logprob) if return_logprobs else None
+
+        if return_logprobs:
+            log_probs = jax.nn.log_softmax(masked)
+            logprob_val = float(log_probs[token_id])
+        else:
+            logprob_val = None
 
         # Check for EOS
         if has_eos and token_id == int(eos_scalar):
@@ -561,8 +589,9 @@ def sample_streaming(model, params, inputs: Union[VLMInputs, jnp.ndarray, np.nda
         # Yield result
         yield (token_id, text, logprob_val)
 
-        # Update current token for next iteration
-        current_token = jnp.array([token_id], dtype=jnp.int32)
+        # Write token to buffer
+        tokens_buf = tokens_buf.at[:, cur_len].set(token_id)
+        cur_len += 1
 
 
 __all__ = [

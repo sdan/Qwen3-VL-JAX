@@ -107,38 +107,6 @@ class Qwen3VLSpec:
     eos_token_id: Optional[int]
 
 
-class KVCache(flax.struct.PyTreeNode):
-    """Stores cached keys/values for efficient autoregressive decoding"""
-    keys: jax.Array      # [layers, batch, heads, max_len, head_dim]
-    values: jax.Array
-    lengths: jax.Array   # [batch] - current fill position per sample
-
-    @classmethod
-    def init(cls, batch: int, num_layers: int, num_heads: int, head_dim: int,
-             max_len: int, dtype: DType) -> "KVCache":
-        keys = jnp.zeros((num_layers, batch, num_heads, max_len, head_dim), dtype=dtype)
-        values = jnp.zeros((num_layers, batch, num_heads, max_len, head_dim), dtype=dtype)
-        lengths = jnp.zeros((batch,), dtype=jnp.int32)
-        return cls(keys=keys, values=values, lengths=lengths)
-
-    def update(self, layer_id: int, k: jax.Array, v: jax.Array,
-               start_positions: jax.Array, chunk_lengths: jax.Array
-               ) -> tuple[jax.Array, jax.Array, "KVCache"]:
-        """Append new k/v for a layer, return full cached tensors"""
-        def _update_one(cache_k, cache_v, new_k, new_v, start, chunk_len):
-            mask = (jnp.arange(new_k.shape[1]) < chunk_len)[None, :, None]
-            new_k, new_v = new_k * mask, new_v * mask
-            updated_k = jax.lax.dynamic_update_slice(cache_k, new_k, (0, start, 0))
-            updated_v = jax.lax.dynamic_update_slice(cache_v, new_v, (0, start, 0))
-            return updated_k, updated_v
-
-        layer_k, layer_v = self.keys[layer_id], self.values[layer_id]
-        new_k, new_v = jax.vmap(_update_one)(layer_k, layer_v, k, v, start_positions, chunk_lengths)
-        cache = self.replace(keys=self.keys.at[layer_id].set(new_k),
-                            values=self.values.at[layer_id].set(new_v))
-        return new_k, new_v, cache
-
-
 # ============================================================================
 # RoPE (Rotary Position Embeddings)
 # ============================================================================
@@ -413,21 +381,16 @@ class MultiHeadAttention(nn.Module):
 
     @nn.compact
     def __call__(self, x: jax.Array, cos: jax.Array, sin: jax.Array,
-                mask: Optional[jax.Array] = None, cache: Optional[KVCache] = None,
-                layer_id: Optional[int] = None, update_lengths: bool = False
-                ) -> tuple[jax.Array, Optional[KVCache]]:
-        """Causal self‑attention with optional grouped‑query and KV cache.
+                mask: Optional[jax.Array] = None) -> jax.Array:
+        """Causal self‑attention with optional grouped‑query.
 
         Args:
             x: [B, T, C]
             cos/sin: RoPE tables (text or mRoPE)
             mask: [B, T] 1 for valid tokens
-            cache: KV cache for decoding; when provided, appends keys/values
-            layer_id: which layer to write into in the cache
-            update_lengths: if True, increments cache lengths by current chunk
 
         Returns:
-            (out, cache) where out is [B, T, C]
+            out: [B, T, C]
         """
         # Project to q, k, v
         q = nn.Dense(self.num_heads * self.head_dim, use_bias=True, dtype=self.dtype, name="q_proj")(x)
@@ -451,25 +414,17 @@ class MultiHeadAttention(nn.Module):
         # Apply RoPE
         q, k = apply_multimodal_rotary_pos_emb(q, k, cos, sin, self.rope_section)
 
-        # Handle masking and cache
+        # Handle masking
         if mask is not None:
             key_mask = mask.astype(jnp.float32)
-            cache_lengths = key_mask.sum(axis=-1).astype(jnp.int32)
+            seq_lengths = key_mask.sum(axis=-1).astype(jnp.int32)
             k = k * key_mask[:, None, :, None].astype(k.dtype)
             v = v * key_mask[:, None, :, None].astype(v.dtype)
         else:
-            cache_lengths = jnp.full((batch,), seqlen, dtype=jnp.int32)
-
-        if cache is not None:
-            k, v, cache = cache.update(layer_id, k, v, cache.lengths, cache_lengths)
-            effective_lengths = cache.lengths + cache_lengths
-            if update_lengths:
-                cache = cache.replace(lengths=effective_lengths)
-        else:
-            effective_lengths = cache_lengths
+            seq_lengths = jnp.full((batch,), seqlen, dtype=jnp.int32)
 
         # Attention computation with grouped-query if needed
-        history_mask = (jnp.arange(k.shape[2])[None, :] < effective_lengths[:, None]).astype(jnp.float32)
+        history_mask = (jnp.arange(k.shape[2])[None, :] < seq_lengths[:, None]).astype(jnp.float32)
         if self.num_heads != self.num_kv_heads:
             repeats = self.num_heads // self.num_kv_heads
             q_grouped = q.reshape(batch, self.num_kv_heads, repeats, q.shape[2], self.head_dim)
@@ -495,8 +450,7 @@ class MultiHeadAttention(nn.Module):
             out = jnp.einsum("bhqk,bhkd->bhqd", weights, v.astype(jnp.float32)).astype(self.dtype)
 
         out = jnp.transpose(out, (0, 2, 1, 3)).reshape(batch, seqlen, -1)
-        out = nn.Dense(self.hidden_size, use_bias=False, dtype=self.dtype, name="o_proj")(out)
-        return out, cache
+        return nn.Dense(self.hidden_size, use_bias=False, dtype=self.dtype, name="o_proj")(out)
 
 
 class DecoderBlock(nn.Module):
@@ -517,12 +471,11 @@ class DecoderBlock(nn.Module):
         self.mlp = FeedForward(self.hidden_size, self.intermediate_size, self.dtype)
 
     def __call__(self, x: jax.Array, cos: jax.Array, sin: jax.Array,
-                mask: Optional[jax.Array], cache: Optional[KVCache], layer_id: int,
-                update_lengths: bool = False) -> tuple[jax.Array, Optional[KVCache]]:
-        attn_out, cache = self.attn(self.input_norm(x), cos, sin, mask, cache, layer_id, update_lengths)
+                mask: Optional[jax.Array] = None) -> jax.Array:
+        attn_out = self.attn(self.input_norm(x), cos, sin, mask)
         x = x + attn_out
         x = x + self.mlp(self.post_norm(x))
-        return x, cache
+        return x
 
 
 # ----------------------------------------------------------------------------
@@ -886,30 +839,25 @@ class Qwen3VLModel(nn.Module):
         return jax.vmap(_add)(hidden, visual_mask.astype(bool), features)
 
     def _decode_from_hidden(self, hidden: jax.Array, cos: jax.Array, sin: jax.Array,
-                           mask: Optional[jax.Array] = None, cache: Optional[KVCache] = None,
+                           mask: Optional[jax.Array] = None,
                            visual_mask: Optional[jax.Array] = None,
-                           deepstack: Optional[tuple] = None) -> tuple[jax.Array, Optional[KVCache]]:
-        new_cache = cache
+                           deepstack: Optional[tuple] = None) -> jax.Array:
         deepstack = deepstack or ()
         for i, layer in enumerate(self.layers):
-            hidden, new_cache = layer(hidden, cos, sin, mask, new_cache, i,
-                                     update_lengths=(cache is not None and i == len(self.layers) - 1))
+            hidden = layer(hidden, cos, sin, mask)
             if deepstack and i < len(deepstack) and visual_mask is not None:
                 hidden = self._apply_deepstack(hidden, visual_mask, deepstack[i])
         hidden = self.final_norm(hidden)
-        logits = self.lm_head(hidden.astype(jnp.float32))
-        return logits, new_cache
+        return self.lm_head(hidden.astype(jnp.float32))
 
     def forward_text(self, tokens: jax.Array, cos: jax.Array, sin: jax.Array,
-                    mask: Optional[jax.Array] = None, cache: Optional[KVCache] = None
-                    ) -> tuple[jax.Array, Optional[KVCache]]:
+                    mask: Optional[jax.Array] = None) -> jax.Array:
         hidden = self.embed(tokens)
-        return self._decode_from_hidden(hidden, cos, sin, mask, cache)
+        return self._decode_from_hidden(hidden, cos, sin, mask)
 
     def forward_vlm(self, tokens: jax.Array, vision_embeds: Union[jax.Array, VisionEmbeddings],
                    image_pad_id: int, cos: jax.Array, sin: jax.Array,
-                   mask: Optional[jax.Array] = None, cache: Optional[KVCache] = None
-                   ) -> tuple[jax.Array, Optional[KVCache]]:
+                   mask: Optional[jax.Array] = None) -> jax.Array:
         hidden = self.embed(tokens)
         batch = hidden.shape[0]
 
@@ -935,7 +883,7 @@ class Qwen3VLModel(nn.Module):
             return h.at[pos].set(updates)
 
         hidden = jax.vmap(_inject)(hidden, tokens, vision_pack.tokens)
-        return self._decode_from_hidden(hidden, cos, sin, mask, cache, visual_mask, vision_pack.deepstack)
+        return self._decode_from_hidden(hidden, cos, sin, mask, visual_mask, vision_pack.deepstack)
 
     def encode_vision(self, pixel_values: jax.Array, grid_thw: jax.Array) -> VisionEmbeddings:
         if self.visual is None:
@@ -943,30 +891,14 @@ class Qwen3VLModel(nn.Module):
         tokens, deepstack = self.visual(pixel_values, grid_thw)
         return VisionEmbeddings(tokens=tokens, deepstack=tuple(deepstack))
 
-    def decode_step(self, token: jax.Array, cache: KVCache, rope_deltas: Optional[jax.Array],
-                   mask: Optional[jax.Array] = None) -> tuple[jax.Array, KVCache]:
-        """Single autoregressive decoding step"""
-        positions = cache.lengths[:, None]
-        batch, axes = positions.shape[0], len(tuple(self.spec.text.rope_section))
-        base_pos = jnp.broadcast_to(positions[None, :, :], (axes, batch, 1))
-        offsets = rope_deltas.astype(jnp.int32)[None, :, :] if rope_deltas is not None else jnp.zeros((axes, batch, 1), dtype=jnp.int32)
-        pos_axes = base_pos + offsets
-        cos, sin = build_mrope(pos_axes, tuple(self.spec.text.rope_section), self.spec.text.rope_theta,
-                              self.dtype, self.spec.text.rope_scaling_type, self.spec.text.rope_scaling_factor,
-                              self.spec.text.mrope_interleaved)
-        mask = mask if mask is not None else jnp.ones((token.shape[0], 1), dtype=jnp.int32)
-        logits, new_cache = self.forward_text(token[:, None], cos, sin, mask, cache)
-        return logits[:, -1, :], new_cache
-
     def __call__(self, tokens: jax.Array, cos: jax.Array, sin: jax.Array,
-                mask: Optional[jax.Array] = None, cache: Optional[KVCache] = None
-                ) -> tuple[jax.Array, Optional[KVCache]]:
-        return self.forward_text(tokens, cos, sin, mask, cache)
+                mask: Optional[jax.Array] = None) -> jax.Array:
+        return self.forward_text(tokens, cos, sin, mask)
 
 
 __all__ = [
     # Specs and containers
-    "TextBackboneSpec", "VisionBackboneSpec", "Qwen3VLSpec", "KVCache", "VisionEmbeddings",
+    "TextBackboneSpec", "VisionBackboneSpec", "Qwen3VLSpec", "VisionEmbeddings",
     # Core layers
     "RMSNorm", "FeedForward", "MLP", "MultiHeadAttention", "CausalSelfAttention", "DecoderBlock", "Block",
     # RoPE
@@ -1130,11 +1062,11 @@ def create_model_from_hf(hf_dir: str) -> tuple[Qwen3VLModel, dict]:
         raise FileNotFoundError(f"No safetensors in {hf_dir}")
 
     for path in safetensor_paths:
-        with safe_open(path, framework="pt", device="cpu") as f:
+        with safe_open(path, framework="numpy") as f:
             for key in f.keys():
                 # Special case: conv->linear for patch_embed
                 if "patch_embed.proj.weight" in key:
-                    tensor = f.get_tensor(key).float().numpy()
+                    tensor = f.get_tensor(key).astype("float32")
                     tensor = tensor.reshape(tensor.shape[0], -1).T
                     params.setdefault("visual", {}).setdefault("patch_embed", {}).setdefault("proj", {})["kernel"] = tensor
                     continue
@@ -1143,7 +1075,7 @@ def create_model_from_hf(hf_dir: str) -> tuple[Qwen3VLModel, dict]:
                 if target is None:
                     continue
 
-                tensor = f.get_tensor(key).float().numpy()
+                tensor = f.get_tensor(key).astype("float32")
                 keys = target.split("/")
                 param_dict = params
                 while len(keys) > 1:
@@ -1183,7 +1115,7 @@ def create_model_from_ckpt(ckpt_dir: str) -> tuple[Qwen3VLModel, dict]:
 
 
 __all__ = [
-    "Qwen3VLModel", "KVCache", "VisionEmbeddings", "Qwen3VLSpec",
+    "Qwen3VLModel", "VisionEmbeddings", "Qwen3VLSpec",
     "build_text_rope", "build_mrope", "get_rope_index",
     "spec_from_config", "create_model_from_hf", "create_model_from_ckpt",
 ]
