@@ -11,11 +11,12 @@ A minimal, readable implementation of Qwen3‑VL inference in JAX/Flax(no PyTorc
 ## Quickstart
 
 - Clone and convert HuggingFace weights to JAX
+  
 Modal:
 ```bash
  modal run modal_app.py --download
 ```
-Or your machine:
+Local:
   ```bash
   git clone https://github.com/sdan/Qwen3-VL-JAX.git && cd Qwen3-VL-JAX
   uv sync  # CPU/default (use `uv sync --extra cuda12` for CUDA 12)
@@ -26,11 +27,12 @@ Or your machine:
   ```
 
 - Run inference (CLI)
+ 
 Modal:
 ```
  modal run modal_app.py --image cat --prompt "Describe this cat"
 ```
-Or your machine:
+Local:
   ```bash
   # Basic (default prompt: "What is shown in this image?")
   uv run python run.py inference.image=examples/imgs/horses.png
