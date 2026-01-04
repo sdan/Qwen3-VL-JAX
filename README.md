@@ -7,6 +7,8 @@ A minimal, readable implementation of Qwen3‑VL inference in JAX/Flax(no PyTorc
 - `sample.py` — Image preprocessing, prompting helpers, top‑k/top‑p sampling
 - `utils.py` — Config (chz), logging, checkpoints, HF→JAX conversion
 - `run.py` — Minimal CLI example
+
+On a H200 I reach a whopping 0.5 tok/s because of JAX JIT issues I was running into that simply make it slower to run, despite the implementation being clean, this shouldn't be run in production.
   
 ## Quickstart
 
